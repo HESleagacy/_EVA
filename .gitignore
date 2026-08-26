@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local project artifacts and credentials
+.env.*
+!.env.example
+evidence/
+*.pptx
