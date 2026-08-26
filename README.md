@@ -1,36 +1,256 @@
 # PPTX Forensics
 
-`pptx-forensics` treats a `.pptx` as an OOXML package first and a presentation
-second. It records the source hash, every package part, relationship graph,
-slide inheritance, media hashes, and XML-visible semantic signals. The
-`python-pptx` layer is optional enrichment and is never the source of truth.
+Forensic extraction and evidence generation for PowerPoint `.pptx` files.
 
-## Usage
+`pptx-forensics` reads a presentation as an OOXML package first and a slide
+deck second. It preserves the original package, extracts native structure and
+provenance, and adds optional OCR, diagram, rendering, and vision evidence
+without allowing derived results to overwrite native facts.
+
+## What It Does
+
+- Extracts package parts, hashes, relationships, slide inheritance, media,
+  notes, comments, hyperlinks, animations, alt text, and embedded parts.
+- Extracts native objects with stable IDs, parent relationships, normalized
+  geometry, z-order, text, styles, semantic projections, and XML provenance.
+- Produces deterministic visual evidence for occupancy, whitespace, margins,
+  overlap, alignment, spacing, clipping, density, font/color patterns,
+  rotations, hierarchy, and image roles.
+- Runs OCR on selected image assets only, with normalized word/line boxes,
+  confidence, caching, and failure metadata.
+- Reconstructs native and raster diagram candidates with explicit uncertainty,
+  endpoint checks, OCR masking, and failure classes.
+- Supports opt-in Gemini vision with strict JSON validation, conservative
+  sanitization, evidence grounding, retries, caching, cost, and latency
+  metadata.
+- Evaluates OCR, diagram, and vision results against labeled annotations.
+
+## Design Principles
+
+- Native OOXML is authoritative.
+- Derived evidence is stored separately from native objects.
+- Every derived record includes status, confidence, source, and evidence
+  references.
+- `verified`, `partial`, `unverified`, `failed`, `not_requested`, and
+  `not_applicable` remain distinct states.
+- No unverified diagram edge is counted as a verified result.
+- Optional stages are explicit and never required for native extraction.
+- Canonical output is deterministic and suitable for hashing and golden tests.
+
+## Installation
+
+The package requires Python 3.10 or newer.
 
 ```bash
-pip install -e '.[pptx,test]'
-pptx-forensics input.pptx --evidence-dir evidence/input
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[pptx]"
 ```
 
-The evidence directory contains the original archive, a copy of each package
-part under `parts/`, and `manifest.json`. Without `--evidence-dir`, extraction
-is read-only and the report is printed as JSON.
+Install development and optional OCR dependencies when needed:
 
-As a library:
+```bash
+python -m pip install -e ".[pptx,test,ocr]"
+```
+
+The OCR extra installs Pillow. Tesseract must also be installed separately if
+the default Tesseract adapter is used.
+
+## Quick Start
+
+Print a canonical report to stdout and retain the source archive and package
+parts as evidence:
+
+```bash
+pptx-forensics input.pptx \
+  --evidence-dir evidence/input \
+  > report.json
+```
+
+Without `--evidence-dir`, extraction is read-only and only the JSON report is
+printed. The evidence directory contains the original archive, package parts
+under `parts/`, and `manifest.json`.
+
+For library use:
 
 ```python
 from pptx_forensics import extract_pptx
 
-report = extract_pptx("deck.pptx", evidence_dir="evidence/deck")
-print(report.to_json())
+report = extract_pptx("input.pptx", evidence_dir="evidence/input")
+payload = report.to_dict()
+print(report.to_canonical_json())
 ```
 
-The package parser uses `defusedxml` for untrusted XML. `python-pptx` can be
-installed as the optional `pptx` extra for convenience-layer shape summaries.
+Use `--native-only` when only package, slide, object, asset, and relationship
+facts are required.
 
-## Canonical DeckIR
+## Command Line Usage
 
-`ExtractionReport.to_dict()` and `manifest.json` use one stable DeckIR contract:
+Run `pptx-forensics --help` for all options. Common workflows are below.
+
+### Rendering
+
+Rendering is optional and only runs for explicitly selected slides. The Aurochs
+renderer is kept outside the Python package:
+
+```bash
+./scripts/fetch_aurochs_renderer.sh
+
+AUROCHS_ROOT=vendor/aurochs \
+  pptx-forensics input.pptx \
+  --evidence-dir evidence/input \
+  --render-slides 1,3-5
+```
+
+Native boxes remain authoritative. Rendered SVG data is used only for
+native-versus-rendered geometry checks. Missing renderers or slide failures are
+recorded as warnings.
+
+### OCR
+
+OCR is asset-scoped. Native text is preferred, and image assets containing
+native text are not sent to OCR.
+
+```bash
+pptx-forensics input.pptx \
+  --evidence-dir evidence/input \
+  --ocr-slides 3,5-10 \
+  --ocr-cache-dir .cache/pptx-ocr
+```
+
+Use `--ocr-assets asset-0016,asset-0029` for explicit asset selection. Use
+`--skip-ocr` to leave the native report unchanged.
+
+### Diagram Reconstruction
+
+Native diagrams use OOXML shapes, connectors, endpoints, arrowheads, and group
+hierarchy. Raster diagrams use the original image asset, optional OCR, and
+deterministic line, contour, box, and arrow heuristics.
+
+```bash
+pptx-forensics input.pptx \
+  --diagram-slides 8-10 \
+  --diagram-ocr-cache-dir .cache/pptx-ocr
+```
+
+Raster detections are candidates, not proof. Missing OCR, unresolved endpoints,
+or zero verified edges keep the graph uncertain. Failure classes include
+`ocr_failure`, `text_mask_failure`, `line_detection_failure`,
+`arrowhead_failure`, `endpoint_matching_failure`, and `graph_assembly_failure`.
+
+### Gemini Vision
+
+Gemini is opt-in. Set `GEMINI_API_KEY` in the environment or a local `.env`
+file before selecting slides or assets:
+
+```bash
+export GEMINI_API_KEY="..."
+
+pptx-forensics input.pptx \
+  --evidence-dir evidence/input \
+  --vision-slides 8-10 \
+  --vision-cache-dir .cache/pptx-vision \
+  --vision-render-dir evidence/input
+```
+
+Requests are limited to selected logical slide or asset targets. Likely logos,
+decorative images, badges, and template images are filtered unless
+`--vision-include-noise` is supplied. Without an API key, the optional stage
+records an unavailable result and makes no network request.
+
+Vision responses use strict `gemini-vision-v3` JSON. Model-only verified claims
+are downgraded, model-only edges remain `unverified`, and invalid JSON/schema
+responses are retried within the configured retry budget. Cache records retain
+the prompt/model/image hash, usage, estimated cost, duration, attempts, and
+sanitization metadata.
+
+## Deterministic Visual Evidence
+
+Visual evidence excludes likely slide chrome from content-area calculations
+while retaining the original native objects. Exclusion reasons can include
+background, master, footer, page number, repeated footer, badge, and template
+noise.
+
+Available signals include:
+
+- Largest empty regions and whitespace balance.
+- Candidate slide titles with placeholder, position, font, and character-count
+  selection evidence.
+- Font distributions and consistency weighted by visible character count.
+- Alignment and spacing peer groups.
+- Native connector count and nullable `flow_candidate` semantics.
+- Image-role candidates based on deterministic native metadata and geometry.
+
+The six content roles are `diagram`, `screenshot`, `chart`, `evidence_image`,
+`logo`, and `decorative_image`. `template` and `unknown` are retained as
+conservative fallback classifications for gating and uncertainty.
+
+## Evaluation
+
+`pptx_forensics.evaluation` provides reproducible metrics against annotations:
+
+- OCR character error rate, word precision/recall/F1, matched-word bounding-box
+  IoU, Brier score, and expected calibration error.
+- Diagram node/edge precision/recall/F1, endpoint accuracy, direction accuracy,
+  and graph connectivity.
+- Vision target completeness, role accuracy, reading order, flow direction,
+  diagram metrics, evidence grounding, hallucination indicators, cache hits,
+  estimated cost, and latency.
+
+Evaluation is written separately from canonical DeckIR:
+
+```bash
+pptx-forensics input.pptx \
+  --diagram-slides 8-10 \
+  --evaluate annotations.json \
+  --evaluation-output evidence/input/evaluation.json
+```
+
+When `--evidence-dir` is supplied without `--evaluation-output`, the sidecar is
+written to `evidence-dir/evaluation.json`. If neither path is supplied, metrics
+are printed to stderr so the canonical report remains valid JSON on stdout.
+
+Annotation files are JSON objects with optional `ocr`, `diagrams`, and `vision`
+sections:
+
+```json
+{
+  "ocr": {
+    "asset-0001": {
+      "text": "Alpha Beta",
+      "words": [
+        {"text": "Alpha", "bbox": [0.1, 0.1, 0.2, 0.1]}
+      ]
+    }
+  },
+  "diagrams": {
+    "slide-08:asset-0002": {
+      "nodes": [
+        {"id": "n1", "label": "Start", "bbox": [0.1, 0.4, 0.1, 0.1]}
+      ],
+      "edges": []
+    }
+  },
+  "vision": {
+    "requested_targets": ["slide-08"],
+    "targets": [
+      {"target": "slide-08", "image_role": "diagram"}
+    ]
+  }
+}
+```
+
+The same report can be evaluated from Python:
+
+```python
+from pptx_forensics import evaluate_report
+
+metrics = evaluate_report(report, labels)
+```
+
+## DeckIR Output
+
+`ExtractionReport.to_dict()` and `manifest.json` use the DeckIR v1 contract:
 
 ```json
 {
@@ -49,289 +269,64 @@ installed as the optional `pptx` extra for convenience-layer shape summaries.
 }
 ```
 
-Native objects are sourced from `native_ooxml` and contain stable IDs, slide
-IDs, parent IDs, normalized bounding boxes, z-order, text, raw and resolved
-style metadata, field-level inheritance sources, semantic status, relationship
-IDs, native shape subtypes, and XML provenance. Native visual geometry facts are emitted in
-`rendered_evidence` with the `rendered_cv` source layer. Rendered computer
-vision, OCR, and vision-model results have separate source provenance. Use
-`DeckIR.add_evidence()` to append derived evidence; it validates the layer and
-cannot overwrite native object facts.
+Native objects use the `native_ooxml` source layer. Derived records are kept in
+`visual_regions`, `rendered_evidence`, `ocr_evidence`, and `vision_evidence`.
+They contain source, confidence, status, and evidence references. The schema
+validator rejects unsupported versions, missing required fields, invalid
+statuses, and derived records without provenance.
 
-## Phase 10: Frozen DeckIR v1
+Slides expose `slide_reading_order`, `diagram_flow_direction`, `flow_present`,
+and `flow_presence_basis` separately. `flow_present` is `true` only when flow
+evidence exists, `false` only with a supported absence basis, and `null` when
+absence cannot be established.
 
-DeckIR v1 is identified by `schema_version: "1.0"` at the canonical root and
-in `deck` and `provenance` metadata. Any schema change requires a version bump;
-the validator rejects unsupported versions and missing required fields.
+## Security And Privacy
 
-Derived records in `visual_regions`, `rendered_evidence`, `ocr_evidence`, and
-`vision_evidence` require top-level `status`, `source`, `confidence`, and
-`evidence_refs`. The only evidence statuses are `verified`, `partial`,
-`unverified`, `failed`, `not_requested`, and `not_applicable`.
+- XML parsing uses `defusedxml`.
+- ZIP path traversal and malformed package inputs are validated.
+- Embedded parts are retained as evidence and never executed.
+- Gemini is disabled unless explicitly selected and configured with an API key.
+- API keys belong in the environment or an ignored local `.env` file, never in
+  source control.
 
-Slides expose separate `slide_reading_order` and `diagram_flow_direction`
-fields. `flow_present` is `true` only when evidence supports a flow, `false`
-only with a supported absence basis, and `null` when it cannot be determined.
-`visual_regions` is a collection of compact region records rather than one
-overloaded visual-region field. Layer availability is named
-`visual_evidence_visibility`; `evidence_quality` is not part of DeckIR v1.
+## Development
 
-## Reproducibility And Benchmarks
-
-`ExtractionReport.to_canonical_json()` emits compact, UTF-8 JSON with sorted
-keys for hashing and golden comparisons. Native slide and object ordering is
-deterministic, and geometry values are rounded to stable precision.
-
-The benchmark suite includes a golden LLVM report and a synthetic fixture for
-text, tables, charts, SmartArt, groups, connectors, hyperlinks, notes,
-embedded objects, and rotated shapes. `compute_metrics()` reports text recall,
-object recall, bounding-box accuracy, relationship resolution, and asset
-resolution.
-
-Malformed XML, external entities, and ZIP path traversal are covered by
-adversarial tests. Open XML SDK validation is an optional sidecar callable
-from Python:
+Run the regression suite from the repository root:
 
 ```bash
-python -c 'from pptx_forensics import validate_with_openxml_sdk; print(validate_with_openxml_sdk("input.pptx"))'
+python -m compileall -q src tests
+pytest -q
 ```
 
-Set `OPENXML_VALIDATOR_COMMAND` or pass `command=...` to
-`validate_with_openxml_sdk(path, command=...)`. The sidecar is not required for
-native extraction.
+The suite includes a synthetic package, adversarial XML/ZIP cases, deterministic
+visual evidence tests, OCR caching tests, diagram uncertainty tests, Gemini
+schema/retry tests, evaluation metrics, and an LLVM golden report.
 
-## Native Style And Semantics
+The current suite passes 38 tests. The LLVM fixture contains 17 slides, 634
+native objects, 37 assets, and 118 relationships.
 
-Phase 3 resolves theme, master, layout, placeholder, shape, paragraph, and run
-formatting without replacing raw OOXML values. Objects also receive native
-semantic projections for tables, charts, SmartArt, groups, images, and embedded
-objects. Embedded parts are retained as evidence and are never executed.
-
-## Phase 6: Native Visual Geometry And Optional Aurochs Rendering
-
-Phase 6 visual extraction is native-only by default. Each slide receives
-deterministic evidence for occupancy, whitespace regions, margins, overlap,
-alignment, equal spacing, clipping/overflow, font-size distribution, color
-consistency, shape density, text density, rotations, native shape hierarchy
-candidates, and native geometry peer groups. Near-aligned objects also produce
-`alignment_mismatch` evidence.
-Displayed image objects inspect the original package asset directly and do not
-rasterize the complete slide. Native fact values use `source: "native_ooxml"`
-and retain the calculation method separately. These records are evidence, not
-SIH quality scores.
-
-When a slide is explicitly rendered, the optional SVG stage adds native versus
-rendered geometry verification facts. It does not replace native boxes and is
-not needed for ordinary extraction.
-
-Native OOXML and asset extraction is the default. Rendering is a separate
-optional stage and runs only for explicitly selected slides:
-
-```bash
-./scripts/fetch_aurochs_renderer.sh
-AUROCHS_ROOT=vendor/aurochs \
-  pptx-forensics deck.pptx \
-  --evidence-dir evidence/deck \
-  --render-slides 1,3-5
-```
-
-The bootstrap uses a sparse checkout of Aurochs' PPTX parser, SVG renderer,
-and their required dependency trees. It does not copy Aurochs into the Python
-package. Rendering creates `rendered/slide-XX.svg` files and appends records to
-`rendered_evidence` containing SVG hashes, cache keys, renderer name, renderer
-commit, and runner provenance.
-
-Render cache keys are:
+## Repository Layout
 
 ```text
-pptx_hash + slide_number + renderer + renderer_version
+src/pptx_forensics/
+  extractor.py       Native OOXML extraction
+  models.py          DeckIR contract and validation
+  visual.py          Deterministic visual evidence
+  ocr.py             Asset-scoped OCR
+  diagrams.py        Native and raster diagram evidence
+  vision.py          Optional Gemini vision
+  evaluation.py      Annotation-based metrics
+  render.py          Optional Aurochs rendering
+  cli.py             Command-line interface
+tests/               Regression and benchmark tests
+renderers/           Renderer runner integrations
+scripts/             Optional renderer bootstrap scripts
 ```
 
-Missing renderers and per-slide render failures become warnings. Native-only
-mode does not require Bun, Aurochs, or any renderer. Use `--native-only` when
-only package, slide, object, asset, and relationship facts are wanted.
+Native extraction is production-oriented. Raster semantic recovery and Gemini
+interpretation remain probabilistic and should be evaluated against labeled
+data before being treated as production-grade quality judgments.
 
-## Optional OCR
+## License
 
-OCR is asset-scoped and is never run against a complete slide. Native text is
-used first; only displayed image assets without native text are sent to the
-OCR adapter:
-
-```bash
-pptx-forensics deck.pptx \
-  --evidence-dir evidence/deck \
-  --ocr-slides 3,5-10 \
-  --ocr-cache-dir .cache/pptx-ocr
-```
-
-Install the Python OCR extra and ensure the Tesseract executable is available:
-`pip install -e '.[ocr]'`. OCR evidence contains normalized word and line
-boxes, confidence, asset hash, engine/version provenance, status, and cache
-key. Slide selection ignores assets smaller than the default `256`-pixel
-threshold; `--ocr-assets` explicitly selects an asset and bypasses that gate.
-Use `--skip-ocr` to produce the same valid native report without OCR.
-
-## Phase 7: Diagram Reconstruction
-
-Phase 7 emits `diagram_graph` evidence records in `rendered_evidence`. Native
-graphs use shape nodes, connector edges, native endpoints, arrowheads, group
-hierarchy, and spatial endpoint proximity. Every node and edge carries
-`evidence_refs` back to native objects or detection/OCR records.
-
-Raster reconstruction is explicit and asset-scoped. It runs OCR, masks OCR text
-regions before line/arrow scans, then applies deterministic
-line/contour/box/arrow heuristics and candidate graph assembly without a model:
-
-```bash
-pptx-forensics deck.pptx \
-  --diagram-slides 8-10 \
-  --diagram-ocr-cache-dir .cache/pptx-ocr
-```
-
-`verified`, `partial`, `unverified`, and `failed` statuses remain visible in
-the graph and its nodes/edges. Raster pixel detections are candidate evidence;
-uncertain endpoint or edge verification keeps the graph `unverified`. Missing
-OCR or zero edge verification can never produce a `verified` graph. Graph
-output is evidence rather than a judgment.
-
-## Phase 9: Selective Gemini Vision
-
-Gemini is an explicit, opt-in interpretation stage. It receives only selected
-original image assets and, when needed, selected rendered slide images or crops,
-together with OCR,
-native object candidates, and diagram evidence. Repeated small corner assets,
-logos, decorative images, and repeated full-slide template images are filtered
-before a request unless `--vision-include-noise` is supplied.
-
-Requests are gated by low OCR confidence, missing diagram edges, unknown image
-role, unclear reading direction, native/rendered disagreement, or unsupported
-SmartArt. Each request is limited to one slide or crop and uses a content-hash
-cache that includes the prompt version, model, image hashes, OCR, and native
-context. Requests use compact context, bounded thinking/output budgets, optional
-bounded concurrency, retries for transient transport failures and invalid
-JSON/schema responses, timeouts, and a circuit breaker.
-
-Responses are post-processed conservatively: model-only verified statuses are
-downgraded, model-only edges remain `unverified`, and obvious slide chrome is
-removed from the diagram graph. Usage, duration, attempts, and sanitization
-counts are retained in the evidence metadata.
-When usage metadata is returned, the evidence also includes an estimated
-standard-tier USD cost using the configured model's reported input, output, and
-thinking token counts.
-
-Gemini results are strict JSON in `vision_evidence` with the `vision_model`
-source layer. They never overwrite native OOXML, rendered geometry, or OCR
-records. Without a configured `GEMINI_API_KEY`, the stage records an unavailable
-optional result and makes no network request. `--skip-vision` leaves the
-deterministic native report unchanged:
-
-```bash
-# Copy `.env.example` to `.env` and set `GEMINI_API_KEY` first.
-pptx-forensics deck.pptx \
-  --vision-slides 8-10 \
-  --vision-cache-dir .cache/pptx-vision \
-  --vision-render-dir evidence/deck
-```
-
-The current vision defaults are a `1024`-token thinking budget, an `8192`
-token output limit, and up to two concurrent Gemini requests. Override them
-with `--vision-thinking-budget`, `--vision-max-output-tokens`, and
-`--vision-concurrency`. Cache records retain the raw API usage metadata,
-estimated standard-tier cost, request duration, attempt count, and
-sanitization counts.
-
-## Phase 12: Deterministic Visual Signals
-
-Native visual evidence now separates slide chrome from likely content before
-computing occupancy. Backgrounds, masters, repeated footers, page numbers,
-badges, and template objects are retained as native objects but reported with
-explicit exclusion reasons. The evidence includes largest empty regions,
-whitespace balance, title candidates, visible-character-weighted font
-distributions, font consistency, alignment/spacing peer groups, and native
-connector counts.
-
-Image-role candidates use deterministic metadata and geometry signals. The
-supported roles are `diagram`, `screenshot`, `chart`, `evidence_image`,
-`logo`, `decorative_image`, `template`, and `unknown`. A slide with zero native
-connectors reports `flow_candidate: null`; it does not claim that no flow is
-present.
-
-## Phase 13: Evaluation And Failure Taxonomy
-
-`pptx_forensics.evaluation` provides reproducible metrics against annotations:
-character error rate, word precision/recall/F1, matched-word bounding-box IoU,
-Brier score, expected calibration error, diagram node/edge precision/recall/F1,
-endpoint and direction accuracy, graph connectivity, and Gemini role/order/
-flow/completeness/grounding metrics. Raster graph output also records ordered
-failure classes such as `ocr_failure`, `line_detection_failure`,
-`arrowhead_failure`, `endpoint_matching_failure`, and
-`graph_assembly_failure`.
-
-Unverified or failed edges are excluded from diagram true positives. Evaluation
-is separate from canonical DeckIR and can be written as a sidecar report:
-
-```bash
-pptx-forensics deck.pptx \
-  --diagram-slides 8-10 \
-  --evaluate annotations.json \
-  --evaluation-output evidence/deck/evaluation.json
-```
-
-The annotation file is a JSON object with optional `ocr`, `diagrams`, and
-`vision` sections. OCR keys are asset IDs; diagram keys are graph IDs or
-`slide-id:asset-id`; vision labels contain `requested_targets` and/or a
-`targets` list with expected roles, reading order, flow direction, or graph
-nodes and edges.
-
-## Phase 14: Scientific Gemini Validation
-
-Gemini responses use `gemini-vision-v3` strict JSON. Each request is scoped to
-one logical slide or asset target, and role-aware gating excludes likely
-decorative, logo, badge, and template images unless explicitly overridden.
-Returned analyses retain target completeness, native/OCR/diagram grounding,
-hallucination indicators, cache hits, attempts, latency, usage, and estimated
-cost. Invalid JSON and schema responses are retried within the configured
-budget and then recorded as failed evidence.
-
-The evaluation sidecar is intended for labeled or synthetic fixtures and can
-compare diagram metrics with a baseline. Without annotations, Gemini results
-remain probabilistic evidence rather than a validated quality score; no live
-request is made without an explicit API key and selection.
-
-## Current Implementation Status
-
-The parser currently provides:
-
-- Direct OOXML package extraction with source/package-part hashes, relationships,
-  slide inheritance, media, notes, comments, hyperlinks, animations, alt text,
-  embedded parts, native shape subtypes, normalized geometry, styles, and
-  provenance.
-- Deterministic native visual evidence for occupancy, whitespace, margins,
-  overlap, alignment, equal spacing, clipping, font/color distributions,
-  density, rotations, hierarchy, peer groups, and image-asset metadata.
-- Optional Aurochs SVG comparison without replacing native geometry.
-- Asset-scoped OCR with normalized word/line boxes and caching.
-- Conservative native and raster diagram candidates with evidence references,
-  OCR masking for line/arrow scans, four diagonal arrow directions, endpoint
-  checks, explicit failure classes, and uncertainty statuses.
-- Opt-in Gemini analysis with strict JSON validation, compact context, image
-  cropping, noise gating, role-aware sanitization, bounded retries/concurrency,
-  circuit breaking, caching, and audit metadata.
-- Annotation-driven OCR, diagram, and Gemini evaluation metrics written as a
-  separate report from canonical DeckIR.
-
-The LLVM benchmark contains `17` slides, `634` native objects, `37` assets, and
-`118` relationships. A fresh slides 8-10 enrichment run completed in `16.42s`
-at an estimated `$0.008298`, with one Gemini request and two logo-only slides
-skipped. Raster reconstruction produced `7` graph candidates with `16` nodes
-and `5` edges; all edges correctly remain unverified because no stronger edge
-evidence is available.
-
-The regression suite currently passes `38` tests. The post-freeze native/OCR/
-raster audit serialized DeckIR `1.0` with `6` OCR records and `7` raster graph
-records without a live Gemini request.
-
-The native extraction layer is production-oriented. Raster semantic recovery
-and Gemini interpretation remain probabilistic and require labeled diagrams or
-synthetic annotations for precision/recall evaluation before they should be
-treated as production-grade.
+Licensed under the GNU General Public License, version 3. See `LICENSE`.
