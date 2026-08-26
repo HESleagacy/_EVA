@@ -22,12 +22,12 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-from .models import ExtractionReport
+from .models import ExtractionReport, IMAGE_ROLES as DECK_IMAGE_ROLES
 from .ocr import run_ocr
 from .config import load_dotenv
 
 
-VISION_SCHEMA_VERSION = "gemini-vision-v2"
+VISION_SCHEMA_VERSION = "gemini-vision-v3"
 VISION_PROMPT_VERSION = "selective-gemini-v4"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_THINKING_BUDGET = 1024
@@ -52,7 +52,7 @@ SUPPORTED_IMAGE_MIMES = {
     "image/heif",
 }
 VISION_STATUSES = {"verified", "partial", "unverified"}
-IMAGE_ROLES = {"diagram", "screenshot", "logo", "template", "decorative", "unknown"}
+IMAGE_ROLES = set(DECK_IMAGE_ROLES)
 READING_DIRECTIONS = {"left_to_right", "right_to_left", "top_to_bottom", "bottom_to_top", "unknown"}
 
 
@@ -66,6 +66,25 @@ def _retryable_vision_error(error: Exception) -> bool:
     if "http 429" in message or "http 500" in message or "http 502" in message or "http 503" in message or "http 504" in message:
         return True
     return any(term in message for term in ("timed out", "timeout", "temporarily unavailable", "connection reset", "connection refused"))
+
+
+def _invalid_vision_response(error: Exception) -> bool:
+    if isinstance(error, (json.JSONDecodeError, TypeError)):
+        return True
+    message = str(error).lower()
+    return any(
+        term in message
+        for term in (
+            "vision response must be",
+            "vision response has",
+            "vision response schema",
+            "vision response did not",
+            "vision response was empty",
+            "vision node schema",
+            "vision edge schema",
+            "vision observation",
+        )
+    )
 
 
 def _vision_evidence_status(status: str) -> str:
@@ -293,6 +312,8 @@ def validate_vision_payload(payload: Any) -> tuple[bool, str]:
             return False, "vision edge schema is invalid"
         if not isinstance(edge["source"], str) or not isinstance(edge["target"], str):
             return False, "vision edge endpoints must be strings"
+        if edge["source"] not in node_ids or edge["target"] not in node_ids:
+            return False, "vision edge endpoints must reference returned nodes"
         if edge["direction"] not in READING_DIRECTIONS or edge["status"] not in VISION_STATUSES or not isinstance(edge["label"], str):
             return False, "vision edge fields are invalid"
     for observation in payload["observations"]:
@@ -363,6 +384,7 @@ def _asset_noise_reasons(
     occurrences: Mapping[str, list[dict[str, Any]]],
     ocr: dict[str, Any] | None,
     graphs: list[dict[str, Any]],
+    deterministic_role: str | None = None,
     *,
     include_noise: bool,
 ) -> list[str]:
@@ -389,6 +411,8 @@ def _asset_noise_reasons(
         reasons.append("recognized_logo_or_watermark_text")
     if tiny and word_count <= 3 and edge_count == 0:
         reasons.append("tiny_low_information_asset")
+    if deterministic_role in {"logo", "decorative_image", "decorative", "template"} and edge_count == 0:
+        reasons.append("deterministic_role_noise")
     return reasons
 
 
@@ -401,10 +425,19 @@ def _asset_gate(
     graphs: list[dict[str, Any]],
     slide_facts: list[dict[str, Any]],
     unsupported_smartart: bool,
+    deterministic_role: str | None = None,
     *,
     include_noise: bool,
 ) -> dict[str, Any]:
-    noise_reasons = _asset_noise_reasons(asset_id, objects, occurrences, ocr, graphs, include_noise=include_noise)
+    noise_reasons = _asset_noise_reasons(
+        asset_id,
+        objects,
+        occurrences,
+        ocr,
+        graphs,
+        deterministic_role,
+        include_noise=include_noise,
+    )
     if noise_reasons:
         return {"selected": False, "reasons": ["noise_filtered", *noise_reasons]}
     reasons: list[str] = []
@@ -460,7 +493,7 @@ def _is_noise_node(node: dict[str, Any]) -> bool:
 
 def _conservatize_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     """Keep model interpretation probabilistic and remove obvious slide chrome."""
-    role_noise = payload.get("image_role") in {"logo", "template", "decorative"}
+    role_noise = payload.get("image_role") in {"logo", "template", "decorative", "decorative_image"}
     removed_ids = {
         node["id"]
         for node in payload["nodes"]
@@ -580,6 +613,76 @@ def _reconcile_payload(
     }
 
 
+def _evidence_grounding(
+    payload: Mapping[str, Any] | None,
+    native: list[dict[str, Any]],
+    ocr: Mapping[str, Any],
+    graphs: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Audit whether model claims have an identifiable native/OCR anchor."""
+    if payload is None:
+        return None
+    native_ids = {str(item.get("id")) for item in native if item.get("id")}
+    context_text = {
+        _normalized_text(item.get("text"))
+        for item in native
+        if len(_normalized_text(item.get("text"))) >= 2
+    }
+    for value in ocr.values():
+        if isinstance(value, dict):
+            context_text.add(_normalized_text(value.get("text")))
+            context_text.update(
+                _normalized_text(item.get("text"))
+                for item in value.get("lines", [])
+                if isinstance(item, dict)
+            )
+    for graph in graphs:
+        for node in graph.get("nodes", []):
+            if isinstance(node, dict):
+                context_text.add(_normalized_text(node.get("text")))
+    context_text.discard("")
+    grounded_nodes: dict[str, bool] = {}
+    node_details: list[dict[str, Any]] = []
+    for node in payload.get("nodes", []):
+        node_id = str(node.get("id", ""))
+        label = _normalized_text(node.get("label"))
+        bases: list[str] = []
+        if node_id in native_ids:
+            bases.append("native_object_id")
+        if label and any(label in text or text in label for text in context_text if len(text) >= 2):
+            bases.append("native_or_ocr_text")
+        grounded = bool(bases)
+        grounded_nodes[node_id] = grounded
+        node_details.append({"id": node_id, "grounded": grounded, "basis": bases})
+    edge_details: list[dict[str, Any]] = []
+    for edge in payload.get("edges", []):
+        source, target = str(edge.get("source", "")), str(edge.get("target", ""))
+        grounded = grounded_nodes.get(source, False) and grounded_nodes.get(target, False)
+        edge_details.append({"source": source, "target": target, "grounded": grounded})
+    node_count = len(node_details)
+    edge_count = len(edge_details)
+    grounded_node_count = sum(item["grounded"] for item in node_details)
+    grounded_edge_count = sum(item["grounded"] for item in edge_details)
+    checks = []
+    if any(not item["grounded"] for item in node_details):
+        checks.append("ungrounded_node_claim")
+    if any(not item["grounded"] for item in edge_details):
+        checks.append("ungrounded_edge_claim")
+    return {
+        "grounding_score": grounded_node_count / node_count if node_count else 1.0,
+        "edge_grounding_score": grounded_edge_count / edge_count if edge_count else 1.0,
+        "grounded_node_count": grounded_node_count,
+        "node_count": node_count,
+        "grounded_edge_count": grounded_edge_count,
+        "edge_count": edge_count,
+        "nodes": node_details,
+        "edges": edge_details,
+        "checks": checks,
+        "hallucination_detected": bool(checks),
+        "warning": "grounding is an audit heuristic and does not prove visual truth",
+    }
+
+
 def _slide_facts(deck: Any, slide_id: str) -> list[dict[str, Any]]:
     useful_types = {
         "slide_occupancy",
@@ -591,6 +694,16 @@ def _slide_facts(deck: Any, slide_id: str) -> list[dict[str, Any]]:
         "rotation",
         "native_rendered_geometry_mismatch",
         "shape_peer_group",
+        "alignment_peer_group",
+        "spacing_peer_group",
+        "largest_empty_region",
+        "whitespace_balance",
+        "native_connector_count",
+        "flow_candidate",
+        "visual_exclusions",
+        "slide_title_candidate",
+        "font_consistency",
+        "image_role_candidate",
     }
     return [
         {
@@ -622,6 +735,28 @@ def _slide_facts(deck: Any, slide_id: str) -> list[dict[str, Any]]:
                     "count",
                     "signature",
                     "basis",
+                    "region",
+                    "area_ratio",
+                    "balance",
+                    "horizontal_balance",
+                    "vertical_balance",
+                    "whitespace_area_ratio",
+                    "native_connector_count",
+                    "flow_candidate",
+                    "evidence_sources",
+                    "image_role",
+                    "role",
+                    "role_scores",
+                    "role_evidence",
+                    "selected_object_id",
+                    "selected_text",
+                    "candidate_count",
+                    "excluded_candidates",
+                    "weighting",
+                    "visible_character_count",
+                    "dominant_size_pt",
+                    "dominant_character_ratio",
+                    "weighted_size_variance",
                 }
             },
         }
@@ -641,6 +776,16 @@ def _graph_by_asset(deck: Any, slide_id: str, asset_id: str) -> list[dict[str, A
         and item["value"].get("type") == "diagram_graph"
         and item["value"].get("asset_id") == asset_id
     ]
+
+
+def _image_role_by_asset(deck: Any) -> dict[str, str]:
+    roles: dict[str, str] = {}
+    for item in deck.rendered_evidence:
+        value = item.get("value") if isinstance(item.get("value"), dict) else {}
+        asset_id, role = value.get("asset_id"), value.get("image_role", value.get("role"))
+        if value.get("type") == "image_role_candidate" and isinstance(asset_id, str) and isinstance(role, str):
+            roles.setdefault(asset_id, role)
+    return roles
 
 
 def _ocr_by_asset(deck: Any) -> dict[str, dict[str, Any]]:
@@ -947,6 +1092,8 @@ def _analyze_with_retries(
                 response_text = json.dumps(response, sort_keys=True, separators=(",", ":"))
             else:
                 response_text = response
+                if not isinstance(response_text, str) or not response_text.strip():
+                    raise VisionRequestError("vision response was empty")
                 candidate = json.loads(response)
             valid, validation_error = validate_vision_payload(candidate)
             if not valid:
@@ -965,8 +1112,9 @@ def _analyze_with_retries(
             }
         except Exception as exc:
             error = str(exc)
-            if attempt < max(0, retries) and retry_backoff > 0 and _retryable_vision_error(exc):
-                time.sleep(retry_backoff * (2**attempt))
+            if attempt < max(0, retries) and (_retryable_vision_error(exc) or _invalid_vision_response(exc)):
+                if retry_backoff > 0:
+                    time.sleep(retry_backoff * (2**attempt))
     return {
         "status": "failed",
         "error": error,
@@ -1023,6 +1171,7 @@ def run_selective_vision(
     if run_ocr_stage and not skip_ocr:
         run_ocr(report, source, slides=slides, asset_ids=asset_ids, cache_dir=ocr_cache_dir, skip=skip_ocr)
     ocr_by_asset = _ocr_by_asset(deck)
+    deterministic_roles = _image_role_by_asset(deck)
     assets = {item.get("id"): item for item in deck.assets if item.get("id")}
     target_slides = set(selected_slides)
     if not target_slides:
@@ -1079,6 +1228,7 @@ def run_selective_vision(
                     graphs,
                     facts,
                     unsupported_smartart,
+                    deterministic_roles.get(asset_id),
                     include_noise=include_noise,
                 )
                 if gate["selected"]:
@@ -1137,6 +1287,7 @@ def run_selective_vision(
                     "selected_asset_ids": selected_asset_ids,
                     "skipped_assets": skipped_assets,
                     "selection_reasons": selection_reasons,
+                    "deterministic_image_roles": {asset_id: deterministic_roles.get(asset_id) for asset_id in selected_asset_ids},
                     "rendered_slide_included": bool(rendered),
                     "rendered_slide_cropped": rendered_cropped,
                     "reason": "noise_filtered" if skipped_assets and not selected_asset_ids and not rendered else "no_visual_input" if not images else "no_trigger",
@@ -1170,6 +1321,7 @@ def run_selective_vision(
                 "selected_asset_ids": selected_asset_ids,
                 "skipped_assets": skipped_assets,
                 "selection_reasons": selection_reasons,
+                "deterministic_image_roles": {asset_id: deterministic_roles.get(asset_id) for asset_id in selected_asset_ids},
                 "slide_reasons": slide_reasons,
                 "rendered_slide_included": bool(rendered),
                 "rendered_slide_cropped": rendered_cropped,
@@ -1190,6 +1342,7 @@ def run_selective_vision(
                 metadata["attempts"] = cached.get("attempts", 0)
                 metadata["sanitization"] = cached.get("sanitization")
                 metadata["evidence_reconciliation"] = _reconcile_payload(cached["analysis"], native, ocr_context, graph_values)
+                metadata["evidence_grounding"] = _evidence_grounding(cached["analysis"], native, ocr_context, graph_values)
                 results.append(
                     _upsert_vision_record(
                         deck,
@@ -1303,6 +1456,12 @@ def run_selective_vision(
             metadata["attempts"] = request_result["attempts"]
             metadata["sanitization"] = request_result["sanitization"]
             metadata["evidence_reconciliation"] = _reconcile_payload(
+                analysis,
+                job["native"],
+                job["ocr"],
+                job["graphs"],
+            )
+            metadata["evidence_grounding"] = _evidence_grounding(
                 analysis,
                 job["native"],
                 job["ocr"],

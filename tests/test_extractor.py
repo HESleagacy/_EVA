@@ -11,11 +11,20 @@ import pytest
 
 from pptx_forensics import diagrams
 from pptx_forensics import DeckIR, ExtractionError, add_native_diagram_evidence, extract_pptx, load_dotenv, reconstruct_raster_diagrams, run_selective_vision
+from pptx_forensics.cli import main as cli_main
 from pptx_forensics.metrics import compute_metrics
 from pptx_forensics.ocr import OcrResult, TesseractOcrAdapter, run_ocr
 from pptx_forensics.render import _svg_visual_features, parse_slide_range, render_selected_slides
 from pptx_forensics.validation import validate_with_openxml_sdk
-from pptx_forensics.visual import add_native_visual_evidence, rendered_geometry_evidence
+from pptx_forensics.visual import add_native_visual_evidence, classify_image_role, rendered_geometry_evidence
+from pptx_forensics.evaluation import (
+    bbox_iou,
+    character_error_rate,
+    confidence_calibration,
+    evaluate_diagram,
+    evaluate_gemini,
+    evaluate_ocr,
+)
 
 
 def _package(path: Path) -> bytes:
@@ -326,6 +335,78 @@ def test_native_visual_geometry_is_reproducible_and_asset_scoped(tmp_path: Path)
     assert image_fact["value"]["decode_status"] == "header_unavailable"
 
 
+def test_phase12_visual_signals_filter_chrome_and_expose_reproducible_metrics() -> None:
+    logo_png = (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\x0dIHDR"
+        + (100).to_bytes(4, "big")
+        + (100).to_bytes(4, "big")
+        + b"\x08\x06\x00\x00\x00"
+    )
+    deck = DeckIR(
+        deck={"slide_aspect_ratio": 1.0},
+        slides=[{"id": "slide-01", "number": 1}, {"id": "slide-02", "number": 2}],
+        objects=[
+            {"id": "background-1", "slide_id": "slide-01", "type": "shape", "name": "Background", "bbox": [0.0, 0.0, 1.0, 1.0], "z_order": 1},
+            {"id": "title-1", "slide_id": "slide-01", "type": "text", "text": "Real title", "bbox": [0.1, 0.05, 0.8, 0.1], "z_order": 2, "style": {"placeholder_type": "title"}, "resolved_style": {"font_size_pt": 32.0}},
+            {"id": "body-1", "slide_id": "slide-01", "type": "text", "text": "A long visible body", "bbox": [0.1, 0.25, 0.4, 0.1], "z_order": 3, "resolved_style": {"font_size_pt": 12.0}},
+            {"id": "logo-1", "slide_id": "slide-01", "type": "image", "name": "Logo", "asset_id": "asset-logo", "bbox": [0.92, 0.92, 0.05, 0.05], "z_order": 4},
+            {"id": "background-2", "slide_id": "slide-02", "type": "shape", "name": "Background", "bbox": [0.0, 0.0, 1.0, 1.0], "z_order": 1},
+            {"id": "footer-2", "slide_id": "slide-02", "type": "text", "text": "Company footer", "bbox": [0.1, 0.94, 0.8, 0.03], "z_order": 2, "style": {"placeholder_type": "ftr"}},
+        ],
+        assets=[{"id": "asset-logo", "part": "ppt/media/logo.png", "content_type": "image/png", "sha256": "logo-hash"}],
+        relationships=[],
+        rendered_evidence=[],
+        ocr_evidence=[],
+        vision_evidence=[],
+        warnings=[],
+        provenance={},
+    )
+
+    add_native_visual_evidence(deck, {"ppt/media/logo.png": logo_png})
+    occupancy = next(item for item in deck.rendered_evidence if item["value"]["type"] == "slide_occupancy" and item["slide_id"] == "slide-01")
+    title = next(item for item in deck.rendered_evidence if item["value"]["type"] == "slide_title_candidate" and item["slide_id"] == "slide-01")
+    role = next(item for item in deck.rendered_evidence if item["value"]["type"] == "image_role_candidate")
+    flow = next(item for item in deck.rendered_evidence if item["value"]["type"] == "flow_candidate" and item["slide_id"] == "slide-01")
+    fact_types = {item["value"]["type"] for item in deck.rendered_evidence}
+
+    assert occupancy["value"]["excluded_object_count"] == 2
+    assert occupancy["value"]["occupied_area_ratio"] < 0.2
+    assert {"background", "badge"} <= {
+        reason
+        for item in occupancy["value"]["excluded_objects"]
+        for reason in item["reasons"]
+    }
+    assert title["value"]["selected_text"] == "Real title"
+    assert role["value"]["image_role"] == "logo"
+    assert flow["value"]["flow_candidate"] is None
+    assert flow["value"]["basis"] == "no_native_connectors_not_evidence_of_absence"
+    assert {"largest_empty_region", "whitespace_balance", "font_consistency", "native_connector_count", "flow_candidate"} <= fact_types
+    distribution = next(item for item in deck.rendered_evidence if item["value"]["type"] == "font_size_distribution" and item["slide_id"] == "slide-01")
+    assert distribution["value"]["weighting"] == "visible_character_count"
+
+
+@pytest.mark.parametrize(
+    ("label", "role"),
+    [
+        ("Process diagram", "diagram"),
+        ("Product screenshot", "screenshot"),
+        ("Quarterly chart", "chart"),
+        ("Error output evidence", "evidence_image"),
+        ("Brand logo", "logo"),
+        ("Decorative background", "decorative_image"),
+    ],
+)
+def test_phase12_image_roles_are_deterministic(label: str, role: str) -> None:
+    result = classify_image_role(
+        {"id": "image-1", "type": "image", "name": label, "bbox": [0.1, 0.1, 0.8, 0.8]},
+        {"part": "ppt/media/image.png"},
+    )
+
+    assert result["image_role"] == role
+    assert result["status"] == "partial"
+
+
 def test_rendered_geometry_verification_is_optional_and_reports_mismatches(tmp_path: Path) -> None:
     source = tmp_path / "rendered-geometry.pptx"
     _geometry_package(source)
@@ -372,7 +453,7 @@ def test_native_visual_facts_cover_spacing_overflow_and_are_idempotent() -> None
     types = {item["value"]["type"] for item in first}
     assert "equal_spacing" in types
     assert "clipping_overflow" in types
-    assert {"alignment_mismatch", "rotation", "rotation_distribution", "shape_hierarchy_candidate", "shape_peer_group"} <= types
+    assert {"alignment_mismatch", "rotation", "rotation_distribution", "shape_hierarchy_candidate", "shape_peer_group", "alignment_peer_group", "spacing_peer_group"} <= types
     mismatch = next(item for item in first if item["value"]["type"] == "alignment_mismatch")
     assert mismatch["value"]["source"] == "native_ooxml"
     assert mismatch["value"]["objects"] == ["shape-1", "shape-5"]
@@ -508,6 +589,122 @@ def test_raster_candidate_edges_require_two_endpoints_and_stay_unverified(monkey
     assert graph["edges"][0]["source"] is not None
     assert graph["edges"][0]["target"] is not None
     assert graph["edges"][0]["evidence_refs"]
+
+
+def test_phase13_ocr_metrics_measure_text_boxes_and_calibration() -> None:
+    reference = {
+        "text": "Alpha Beta",
+        "words": [
+            {"text": "Alpha", "bbox": [0.1, 0.1, 0.2, 0.1]},
+            {"text": "Beta", "bbox": [0.4, 0.1, 0.2, 0.1]},
+        ],
+    }
+    hypothesis = {
+        "text": "Alpha Gamma",
+        "words": [
+            {"text": "Alpha", "bbox": [0.1, 0.1, 0.2, 0.1], "confidence": 0.9},
+            {"text": "Gamma", "bbox": [0.4, 0.1, 0.2, 0.1], "confidence": 0.2},
+        ],
+    }
+
+    metrics = evaluate_ocr(reference, hypothesis)
+    assert metrics["word_precision"] == 0.5
+    assert metrics["word_recall"] == 0.5
+    assert metrics["bbox_iou"] == 1.0
+    assert metrics["confidence_calibration"]["sample_count"] == 2
+    assert bbox_iou([0, 0, 1, 1], [0, 0, 1, 1]) == 1.0
+    assert character_error_rate("kitten", "sitting") == 3 / 6
+    calibration = confidence_calibration(
+        [{"confidence": 0.9, "correct": True}, {"confidence": 0.1, "correct": False}]
+    )
+    assert calibration["brier_score"] == pytest.approx(0.01)
+
+
+def test_phase13_diagram_metrics_never_credit_unverified_edges() -> None:
+    reference = {
+        "nodes": [
+            {"id": "a", "label": "A", "bbox": [0.1, 0.1, 0.1, 0.1]},
+            {"id": "b", "label": "B", "bbox": [0.4, 0.1, 0.1, 0.1]},
+            {"id": "c", "label": "C", "bbox": [0.7, 0.1, 0.1, 0.1]},
+        ],
+        "edges": [
+            {"source": "a", "target": "b", "direction": "left_to_right"},
+            {"source": "b", "target": "c", "direction": "left_to_right"},
+        ],
+    }
+    hypothesis = {
+        "nodes": reference["nodes"],
+        "edges": [
+            {"source": "a", "target": "b", "direction": "left_to_right", "status": "verified"},
+            {"source": "b", "target": "c", "direction": "left_to_right", "status": "unverified"},
+        ],
+    }
+
+    metrics = evaluate_diagram(reference, hypothesis)
+    assert metrics["node_f1"] == 1.0
+    assert metrics["edge_precision"] == 0.5
+    assert metrics["edge_recall"] == 0.5
+    assert metrics["verified_edge_count"] == 1
+    assert metrics["unverified_edge_count"] == 1
+    assert metrics["unverified_edges_counted_as_true_positive"] == 0
+
+
+def test_phase13_raster_failure_classes_preserve_the_failure_chain() -> None:
+    failures = diagrams.classify_raster_failure_classes(
+        ocr_status="unverified",
+        ocr_line_count=0,
+        masked_pixel_count=0,
+        line_count=0,
+        arrow_count=0,
+        node_count=0,
+        edge_count=0,
+        unresolved_edge_count=0,
+    )
+    assert failures == ["ocr_failure", "line_detection_failure", "arrowhead_failure", "graph_assembly_failure"]
+
+
+def test_phase14_gemini_evaluation_checks_completeness_roles_flow_and_grounding() -> None:
+    analysis = _vision_payload()
+    analysis["image_role"] = "diagram"
+    analysis["slide_reading_order"] = "left_to_right"
+    analysis["diagram_flow_direction"] = "left_to_right"
+    analysis["nodes"] = [{"id": "a", "label": "A", "bbox": [0.1, 0.1, 0.1, 0.1], "status": "partial"}]
+    records = [
+        {
+            "id": "vision-gemini-slide-01",
+            "slide_id": "slide-01",
+            "status": "partial",
+            "value": {
+                "target": "slide-01",
+                "analysis": analysis,
+                "metadata": {
+                    "evidence_grounding": {"grounding_score": 1.0, "hallucination_detected": False},
+                    "estimated_cost_usd": 0.001,
+                    "request_seconds": 0.2,
+                },
+            },
+            "source": {"cache_hit": True},
+        }
+    ]
+    labels = {
+        "requested_targets": ["slide-01"],
+        "targets": [
+            {
+                "target": "slide-01",
+                "image_role": "diagram",
+                "slide_reading_order": "left_to_right",
+                "diagram_flow_direction": "left_to_right",
+            }
+        ],
+    }
+
+    metrics = evaluate_gemini(records, labels)
+    assert metrics["completeness"]["complete"] is True
+    assert metrics["role_accuracy"] == 1.0
+    assert metrics["reading_order_accuracy"] == 1.0
+    assert metrics["flow_direction_accuracy"] == 1.0
+    assert metrics["grounding_score"] == 1.0
+    assert metrics["cache_hit_rate"] == 1.0
 
 
 def test_extracts_deterministic_svg_visual_features() -> None:
@@ -732,7 +929,7 @@ def test_ocr_is_asset_scoped_cached_and_skippable(tmp_path: Path) -> None:
 
 def _vision_payload() -> dict[str, object]:
     return {
-        "schema_version": "gemini-vision-v2",
+        "schema_version": "gemini-vision-v3",
         "image_role": "diagram",
         "summary": "A candidate diagram.",
         "slide_reading_order": "unknown",
@@ -921,6 +1118,53 @@ def test_selective_vision_rejects_non_strict_model_json_and_skip_is_unchanged(tm
     )
     assert records[0]["value"]["status"] == "failed"
     assert "unexpected or missing" in records[0]["value"]["error"]
+
+
+def test_selective_vision_retries_invalid_json_within_budget(tmp_path: Path) -> None:
+    source = tmp_path / "vision-retry.pptx"
+    _feature_package(source)
+
+    class RetryVision:
+        name = "retry-vision"
+        version = "1.0"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def analyze(self, prompt: str, images: list[object], timeout: float) -> str:
+            self.calls += 1
+            return "not json" if self.calls == 1 else json.dumps(_vision_payload())
+
+    adapter = RetryVision()
+    report = extract_pptx(source)
+    records = run_selective_vision(
+        report,
+        source,
+        asset_ids=["asset-0002"],
+        adapter=adapter,
+        run_ocr_stage=False,
+        include_noise=True,
+        retries=1,
+        retry_backoff=0,
+        cache_dir=tmp_path / "retry-cache",
+    )
+
+    assert adapter.calls == 2
+    assert records[0]["value"]["status"] == "partial"
+    assert records[0]["value"]["metadata"]["attempts"] == 2
+
+
+def test_evaluation_cli_writes_metrics_outside_canonical_report(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    source = tmp_path / "evaluation.pptx"
+    _package(source)
+    labels = tmp_path / "labels.json"
+    labels.write_text(json.dumps({"ocr": {}}), encoding="utf-8")
+    output = tmp_path / "results" / "evaluation.json"
+
+    assert cli_main([str(source), "--evaluate", str(labels), "--evaluation-output", str(output)]) == 0
+    evaluation = json.loads(output.read_text(encoding="utf-8"))
+    assert evaluation == {"diagrams": {}, "ocr": {}, "schema_version": "1.0"}
+    assert json.loads(capsys.readouterr().out)["schema_version"] == "1.0"
 
 
 def test_load_dotenv_reads_local_values_without_overriding_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

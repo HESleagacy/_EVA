@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import sys
@@ -10,6 +11,7 @@ import sys
 from .extractor import ExtractionError, extract_pptx
 from .config import load_dotenv
 from .diagrams import reconstruct_raster_diagrams
+from .evaluation import evaluate_report
 from .ocr import run_ocr
 from .render import parse_slide_range, render_selected_slides
 from .vision import run_selective_vision
@@ -44,7 +46,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--vision-concurrency", type=int, default=2, help="maximum concurrent Gemini requests")
     parser.add_argument("--vision-include-noise", action="store_true", help="allow likely logos and template images through the vision gate")
     parser.add_argument("--skip-vision", action="store_true", help="do not run the optional Gemini vision stage")
+    parser.add_argument("--evaluate", type=Path, metavar="LABELS", help="evaluate the extracted report against a JSON annotation file")
+    parser.add_argument("--evaluation-output", type=Path, metavar="PATH", help="write evaluation metrics JSON to this path")
     args = parser.parse_args(argv)
+    if args.evaluation_output and not args.evaluate:
+        parser.error("--evaluation-output requires --evaluate")
     if args.render_slides and args.evidence_dir is None:
         parser.error("--evidence-dir is required when --render-slides is used")
     try:
@@ -124,6 +130,23 @@ def main(argv: list[str] | None = None) -> int:
                 max_concurrency=args.vision_concurrency,
             )
             enriched = True
+        if args.evaluate:
+            try:
+                labels = json.loads(args.evaluate.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                parser.error(f"cannot read evaluation labels: {exc}")
+            if not isinstance(labels, dict):
+                parser.error("evaluation labels must be a JSON object")
+            evaluation = evaluate_report(report, labels)
+            evaluation_path = args.evaluation_output
+            if evaluation_path is None and args.evidence_dir is not None:
+                evaluation_path = Path(args.evidence_dir) / "evaluation.json"
+            if evaluation_path is not None:
+                evaluation_path = evaluation_path.expanduser().resolve()
+                evaluation_path.parent.mkdir(parents=True, exist_ok=True)
+                evaluation_path.write_text(json.dumps(evaluation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            else:
+                print(json.dumps(evaluation, indent=2, sort_keys=True), file=sys.stderr)
         if enriched and args.evidence_dir is not None:
             evidence_dir = Path(args.evidence_dir).expanduser().resolve()
             (evidence_dir / "manifest.json").write_text(report.to_json() + "\n", encoding="utf-8")

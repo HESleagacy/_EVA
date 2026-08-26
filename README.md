@@ -208,8 +208,8 @@ role, unclear reading direction, native/rendered disagreement, or unsupported
 SmartArt. Each request is limited to one slide or crop and uses a content-hash
 cache that includes the prompt version, model, image hashes, OCR, and native
 context. Requests use compact context, bounded thinking/output budgets, optional
- bounded concurrency, retries only for transient transport failures, timeouts,
- and a circuit breaker.
+bounded concurrency, retries for transient transport failures and invalid
+JSON/schema responses, timeouts, and a circuit breaker.
 
 Responses are post-processed conservatively: model-only verified statuses are
 downgraded, model-only edges remain `unverified`, and obvious slide chrome is
@@ -240,6 +240,64 @@ with `--vision-thinking-budget`, `--vision-max-output-tokens`, and
 estimated standard-tier cost, request duration, attempt count, and
 sanitization counts.
 
+## Phase 12: Deterministic Visual Signals
+
+Native visual evidence now separates slide chrome from likely content before
+computing occupancy. Backgrounds, masters, repeated footers, page numbers,
+badges, and template objects are retained as native objects but reported with
+explicit exclusion reasons. The evidence includes largest empty regions,
+whitespace balance, title candidates, visible-character-weighted font
+distributions, font consistency, alignment/spacing peer groups, and native
+connector counts.
+
+Image-role candidates use deterministic metadata and geometry signals. The
+supported roles are `diagram`, `screenshot`, `chart`, `evidence_image`,
+`logo`, `decorative_image`, `template`, and `unknown`. A slide with zero native
+connectors reports `flow_candidate: null`; it does not claim that no flow is
+present.
+
+## Phase 13: Evaluation And Failure Taxonomy
+
+`pptx_forensics.evaluation` provides reproducible metrics against annotations:
+character error rate, word precision/recall/F1, matched-word bounding-box IoU,
+Brier score, expected calibration error, diagram node/edge precision/recall/F1,
+endpoint and direction accuracy, graph connectivity, and Gemini role/order/
+flow/completeness/grounding metrics. Raster graph output also records ordered
+failure classes such as `ocr_failure`, `line_detection_failure`,
+`arrowhead_failure`, `endpoint_matching_failure`, and
+`graph_assembly_failure`.
+
+Unverified or failed edges are excluded from diagram true positives. Evaluation
+is separate from canonical DeckIR and can be written as a sidecar report:
+
+```bash
+pptx-forensics deck.pptx \
+  --diagram-slides 8-10 \
+  --evaluate annotations.json \
+  --evaluation-output evidence/deck/evaluation.json
+```
+
+The annotation file is a JSON object with optional `ocr`, `diagrams`, and
+`vision` sections. OCR keys are asset IDs; diagram keys are graph IDs or
+`slide-id:asset-id`; vision labels contain `requested_targets` and/or a
+`targets` list with expected roles, reading order, flow direction, or graph
+nodes and edges.
+
+## Phase 14: Scientific Gemini Validation
+
+Gemini responses use `gemini-vision-v3` strict JSON. Each request is scoped to
+one logical slide or asset target, and role-aware gating excludes likely
+decorative, logo, badge, and template images unless explicitly overridden.
+Returned analyses retain target completeness, native/OCR/diagram grounding,
+hallucination indicators, cache hits, attempts, latency, usage, and estimated
+cost. Invalid JSON and schema responses are retried within the configured
+budget and then recorded as failed evidence.
+
+The evaluation sidecar is intended for labeled or synthetic fixtures and can
+compare diagram metrics with a baseline. Without annotations, Gemini results
+remain probabilistic evidence rather than a validated quality score; no live
+request is made without an explicit API key and selection.
+
 ## Current Implementation Status
 
 The parser currently provides:
@@ -255,10 +313,12 @@ The parser currently provides:
 - Asset-scoped OCR with normalized word/line boxes and caching.
 - Conservative native and raster diagram candidates with evidence references,
   OCR masking for line/arrow scans, four diagonal arrow directions, endpoint
-  checks, and explicit uncertainty statuses.
+  checks, explicit failure classes, and uncertainty statuses.
 - Opt-in Gemini analysis with strict JSON validation, compact context, image
   cropping, noise gating, role-aware sanitization, bounded retries/concurrency,
   circuit breaking, caching, and audit metadata.
+- Annotation-driven OCR, diagram, and Gemini evaluation metrics written as a
+  separate report from canonical DeckIR.
 
 The LLVM benchmark contains `17` slides, `634` native objects, `37` assets, and
 `118` relationships. A fresh slides 8-10 enrichment run completed in `16.42s`
@@ -267,10 +327,11 @@ skipped. Raster reconstruction produced `7` graph candidates with `16` nodes
 and `5` edges; all edges correctly remain unverified because no stronger edge
 evidence is available.
 
-The regression suite currently passes `25` tests. The post-freeze native/OCR/
+The regression suite currently passes `38` tests. The post-freeze native/OCR/
 raster audit serialized DeckIR `1.0` with `6` OCR records and `7` raster graph
 records without a live Gemini request.
 
 The native extraction layer is production-oriented. Raster semantic recovery
-and Gemini interpretation remain probabilistic and require labeled diagrams for
-precision/recall evaluation before they should be treated as production-grade.
+and Gemini interpretation remain probabilistic and require labeled diagrams or
+synthetic annotations for precision/recall evaluation before they should be
+treated as production-grade.
