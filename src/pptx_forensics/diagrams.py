@@ -27,6 +27,14 @@ RASTER_MIN_SEGMENT = 0.04
 RASTER_MAX_SEGMENTS = 128
 RASTER_MAX_CONTOURS = 128
 RASTER_ENDPOINT_TOLERANCE = 0.06
+RASTER_FAILURE_CLASSES = (
+    "ocr_failure",
+    "text_mask_failure",
+    "line_detection_failure",
+    "arrowhead_failure",
+    "endpoint_matching_failure",
+    "graph_assembly_failure",
+)
 
 Box = tuple[float, float, float, float]
 Point = tuple[float, float]
@@ -431,6 +439,8 @@ def _native_graph(deck: DeckIR, slide: dict[str, Any]) -> dict[str, Any] | None:
         "type": "diagram_graph",
         "branch": "native",
         "status": status,
+        "native_connector_count": len(connectors),
+        "flow_candidate": True if connectors else None,
         "nodes": nodes,
         "edges": edges,
         "groups": groups,
@@ -771,6 +781,34 @@ def _ocr_status(record: dict[str, Any] | None) -> str:
     return "unverified"
 
 
+def classify_raster_failure_classes(
+    *,
+    ocr_status: str,
+    ocr_line_count: int,
+    masked_pixel_count: int,
+    line_count: int,
+    arrow_count: int,
+    node_count: int,
+    edge_count: int,
+    unresolved_edge_count: int,
+) -> list[str]:
+    """Return ordered failure stages without treating candidates as successes."""
+    failures: list[str] = []
+    if ocr_status != "verified":
+        failures.append("ocr_failure")
+    elif ocr_line_count and masked_pixel_count == 0:
+        failures.append("text_mask_failure")
+    if line_count == 0:
+        failures.append("line_detection_failure")
+    if arrow_count == 0:
+        failures.append("arrowhead_failure")
+    if unresolved_edge_count or (line_count and edge_count == 0):
+        failures.append("endpoint_matching_failure")
+    if node_count == 0 or edge_count == 0:
+        failures.append("graph_assembly_failure")
+    return [failure for failure in RASTER_FAILURE_CLASSES if failure in failures]
+
+
 def _raster_graph(
     deck: DeckIR,
     slide_id: str,
@@ -815,6 +853,16 @@ def _raster_graph(
             confidence=None,
         )
         detection_refs.append(_evidence_ref(line_record, "raster_line_detection"))
+        failure_classes = classify_raster_failure_classes(
+            ocr_status=ocr_state,
+            ocr_line_count=len(ocr_lines),
+            masked_pixel_count=0,
+            line_count=0,
+            arrow_count=0,
+            node_count=0,
+            edge_count=0,
+            unresolved_edge_count=0,
+        )
         graph = {
             "type": "diagram_graph",
             "branch": "raster",
@@ -829,8 +877,11 @@ def _raster_graph(
             "diagram_flow_direction": "unknown",
             "flow_present": None,
             "flow_presence_basis": "undetermined",
+            "flow_candidate": None,
             "evidence_refs": asset_evidence_refs + detection_refs + ([_evidence_ref(ocr_record, "ocr_evidence")] if ocr_record else []),
             "missing_evidence": ["image_decode"],
+            "failure_classes": failure_classes,
+            "failure_class": failure_classes[0] if failure_classes else None,
             "ocr_status": ocr_state,
             "coordinate_space": "asset_normalized",
             "display_bbox": _box_list(object_bbox),
@@ -995,6 +1046,16 @@ def _raster_graph(
         status = "verified"
     else:
         status = "partial"
+    failure_classes = classify_raster_failure_classes(
+        ocr_status=ocr_state,
+        ocr_line_count=ocr_line_count,
+        masked_pixel_count=masked_pixel_count,
+        line_count=len(line_values),
+        arrow_count=len(arrow_candidates),
+        node_count=len(nodes),
+        edge_count=len(edge_candidates),
+        unresolved_edge_count=unresolved_edge_candidates,
+    )
     graph = {
         "type": "diagram_graph",
         "branch": "raster",
@@ -1009,10 +1070,13 @@ def _raster_graph(
         "edge_verification": _round(edge_verification),
         "diagram_flow_direction": _raster_flow_direction(edge_candidates, {node["id"]: node for node in nodes}),
         "flow_present": True if edge_candidates else None,
+        "flow_candidate": True if edge_candidates else None,
         "flow_presence_basis": "raster_edge_candidate" if edge_candidates else "undetermined",
         "ocr_status": ocr_state,
         "evidence_refs": asset_evidence_refs + detection_refs + ([_evidence_ref(ocr_record, "ocr_evidence")] if ocr_record else []),
         "missing_evidence": missing_evidence,
+        "failure_classes": failure_classes,
+        "failure_class": failure_classes[0] if failure_classes else None,
         "coordinate_space": "asset_normalized",
         "display_bbox": _box_list(object_bbox),
         "display_crop": display_geometry.get("crop"),

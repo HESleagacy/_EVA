@@ -27,6 +27,10 @@ def _evidence_status(status: str) -> str:
     }.get(status, "failed")
 
 
+def _failure_class(status: str) -> str | None:
+    return "ocr_failure" if status != "ok" else None
+
+
 def _merge_stage_status(previous: str, current: str) -> str:
     if previous == "not_requested":
         return current
@@ -58,6 +62,7 @@ class OcrResult:
     image_height: int | None
     confidence: float | None
     error: str | None = None
+    failure_class: str | None = None
 
 
 def _normalised_box(left: float, top: float, width: float, height: float, image_width: int, image_height: int) -> list[float]:
@@ -284,6 +289,7 @@ def run_ocr(
                     "lines": result.lines,
                     "image_size": [result.image_width, result.image_height],
                     "error": result.error,
+                    "failure_class": result.failure_class or _failure_class(result.status),
                     "cache_key": key,
                     "native_text_used": False,
                 },
