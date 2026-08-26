@@ -28,6 +28,18 @@ READING_DIRECTIONS = frozenset(
         "unknown",
     }
 )
+IMAGE_ROLES = frozenset(
+    {
+        "diagram",
+        "screenshot",
+        "chart",
+        "evidence_image",
+        "logo",
+        "decorative_image",
+        "template",
+        "unknown",
+    }
+)
 CANONICAL_KEYS = (
     "schema_version",
     "deck",
