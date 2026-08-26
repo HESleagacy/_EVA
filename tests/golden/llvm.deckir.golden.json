@@ -1,0 +1,18 @@
+{
+  "canonical_sha256": "6b6e05f9056be399652455d4e5aa320a787b7e37279e6be1c7721efa0567427b",
+  "canonical_utf8_bytes": 3602103,
+  "source_sha256": "49567d1cafbff7a93886fbff2ebf3a83c2a53a22992f51cf820a2b72a2017aeb",
+  "counts": {
+    "slides": 17,
+    "objects": 634,
+    "assets": 37,
+    "relationships": 118,
+    "package_parts": 94
+  },
+  "object_types": {
+    "group": 76,
+    "image": 85,
+    "table": 3,
+    "text": 470
+  }
+}
