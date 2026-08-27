@@ -6,6 +6,8 @@ from typing import Any
 
 
 def _payload(report: Any) -> dict[str, Any]:
+    if hasattr(report, "to_debug_dict"):
+        return report.to_debug_dict()
     if hasattr(report, "to_dict"):
         return report.to_dict()
     return report

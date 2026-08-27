@@ -8,6 +8,8 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 def _payload(value: Any) -> dict[str, Any]:
+    if hasattr(value, "to_debug_dict"):
+        return value.to_debug_dict()
     if hasattr(value, "to_dict"):
         return value.to_dict()
     return value if isinstance(value, dict) else {}
