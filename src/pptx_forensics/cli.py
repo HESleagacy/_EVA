@@ -22,6 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Extract a PPTX as an OOXML forensic package")
     parser.add_argument("source", type=Path)
     parser.add_argument("--evidence-dir", type=Path, help="directory in which to retain original and package parts")
+    parser.add_argument("--output", type=Path, help="write the Markdown report to this path; it must end in .md")
     parser.add_argument("--render-slides", help="render selected slides with Aurochs, e.g. 1,3-5")
     parser.add_argument("--aurochs-root", type=Path, help="sparse Aurochs checkout (or use AUROCHS_ROOT)")
     parser.add_argument("--render-cache-dir", type=Path, help="render cache directory")
@@ -53,6 +54,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--evaluation-output requires --evaluate")
     if args.render_slides and args.evidence_dir is None:
         parser.error("--evidence-dir is required when --render-slides is used")
+    if args.output is not None and args.output.suffix.casefold() != ".md":
+        parser.error("--output must end in .md")
     try:
         report = extract_pptx(
             args.source,
@@ -60,7 +63,6 @@ def main(argv: list[str] | None = None) -> int:
             include_visual_evidence=not args.native_only,
             include_native_diagrams=not args.native_only,
         )
-        enriched = False
         if args.render_slides:
             try:
                 slides = parse_slide_range(args.render_slides)
@@ -74,7 +76,6 @@ def main(argv: list[str] | None = None) -> int:
                 renderer_root=args.aurochs_root,
                 cache_dir=args.render_cache_dir,
             )
-            enriched = True
         if (args.ocr_slides or args.ocr_assets) and not args.skip_ocr:
             try:
                 ocr_slides = parse_slide_range(args.ocr_slides) if args.ocr_slides else None
@@ -88,7 +89,6 @@ def main(argv: list[str] | None = None) -> int:
                 asset_ids=ocr_assets,
                 cache_dir=args.ocr_cache_dir,
             )
-            enriched = True
         if args.diagram_slides or args.diagram_assets:
             try:
                 diagram_slides = parse_slide_range(args.diagram_slides) if args.diagram_slides else None
@@ -104,7 +104,6 @@ def main(argv: list[str] | None = None) -> int:
                 run_ocr_stage=not args.skip_ocr,
                 skip_ocr=args.skip_ocr,
             )
-            enriched = True
         if (args.vision_slides or args.vision_assets) and not args.skip_vision:
             try:
                 vision_slides = parse_slide_range(args.vision_slides) if args.vision_slides else None
@@ -129,7 +128,6 @@ def main(argv: list[str] | None = None) -> int:
                 max_output_tokens=args.vision_max_output_tokens,
                 max_concurrency=args.vision_concurrency,
             )
-            enriched = True
         if args.evaluate:
             try:
                 labels = json.loads(args.evaluate.read_text(encoding="utf-8"))
@@ -147,12 +145,15 @@ def main(argv: list[str] | None = None) -> int:
                 evaluation_path.write_text(json.dumps(evaluation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             else:
                 print(json.dumps(evaluation, indent=2, sort_keys=True), file=sys.stderr)
-        if enriched and args.evidence_dir is not None:
-            evidence_dir = Path(args.evidence_dir).expanduser().resolve()
-            (evidence_dir / "manifest.json").write_text(report.to_json() + "\n", encoding="utf-8")
     except ExtractionError as exc:
         parser.error(str(exc))
-    print(report.to_json())
+    output = report.to_markdown()
+    if args.output is not None:
+        output_path = args.output.expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(output, encoding="utf-8")
+    else:
+        print(output, end="")
     return 0
 
 

@@ -133,7 +133,7 @@ def test_extracts_package_evidence_and_slide_semantics(tmp_path: Path) -> None:
     assert report.comments[0]["text"] == "Review this"
     assert (evidence / "original.pptx").read_bytes() == source_bytes
     assert (evidence / "parts/ppt/slides/slide1.xml").exists()
-    assert (evidence / "manifest.json").exists()
+    assert sorted(path.name for path in evidence.iterdir()) == ["original.pptx", "parts"]
 
     canonical = report.to_dict()
     assert set(canonical) == {
@@ -1164,7 +1164,7 @@ def test_evaluation_cli_writes_metrics_outside_canonical_report(tmp_path: Path, 
     assert cli_main([str(source), "--evaluate", str(labels), "--evaluation-output", str(output)]) == 0
     evaluation = json.loads(output.read_text(encoding="utf-8"))
     assert evaluation == {"diagrams": {}, "ocr": {}, "schema_version": "1.0"}
-    assert json.loads(capsys.readouterr().out)["schema_version"] == "1.0"
+    assert capsys.readouterr().out.startswith("# Parsed Presentation\n")
 
 
 def test_load_dotenv_reads_local_values_without_overriding_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1182,11 +1182,12 @@ def test_load_dotenv_reads_local_values_without_overriding_environment(tmp_path:
     assert os.environ["GEMINI_API_KEY"] == "from-file"
 
 
-def test_llvm_golden_report() -> None:
-    source = Path(__file__).parents[1] / "Copy of LLVM (1).pptx"
-    if not source.exists():
-        pytest.skip("LLVM deck is supplied as a local benchmark artifact")
-    golden = json.loads((Path(__file__).parent / "golden/llvm.deckir.golden.json").read_text())
+def test_benchmark_golden_report() -> None:
+    sources = sorted(Path(__file__).parents[1].glob("*.pptx"))
+    source = sources[0] if sources else None
+    if source is None:
+        pytest.skip("A local benchmark artifact is not available")
+    golden = json.loads((Path(__file__).parent / "golden/benchmark.deckir.golden.json").read_text())
     report = extract_pptx(source)
     canonical = report.to_dict()
     object_types = {}

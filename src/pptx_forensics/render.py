@@ -264,8 +264,4 @@ def render_selected_slides(
             visibility = slide_record.setdefault("visual_evidence_visibility", {})
             visibility["rendered"] = render_status
         evidence.extend(rendered_geometry_evidence(report.canonical, slide, data))
-    try:
-        (output_root / "manifest.json").write_text(report.to_json() + "\n", encoding="utf-8")
-    except OSError as exc:
-        _warning(report, f"Could not update evidence manifest after rendering: {exc}")
     return evidence

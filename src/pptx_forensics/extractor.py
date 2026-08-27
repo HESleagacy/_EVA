@@ -749,5 +749,4 @@ def extract_pptx(
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(raw)
         report.evidence_dir = str(destination)
-        (destination / "manifest.json").write_text(report.to_json() + "\n", encoding="utf-8")
     return report
