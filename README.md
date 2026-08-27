@@ -58,18 +58,23 @@ the default Tesseract adapter is used.
 
 ## Quick Start
 
-Print a canonical report to stdout and retain the source archive and package
-parts as evidence:
+Write one descriptive Markdown report:
+
+```bash
+pptx-forensics input.pptx --output report.md
+```
+
+Use `--evidence-dir` when the original archive and package parts are also
+needed; the report remains the single Markdown output:
 
 ```bash
 pptx-forensics input.pptx \
   --evidence-dir evidence/input \
-  > report.json
+  --output report.md
 ```
 
-Without `--evidence-dir`, extraction is read-only and only the JSON report is
-printed. The evidence directory contains the original archive, package parts
-under `parts/`, and `manifest.json`.
+Without `--output`, the Markdown report is printed to stdout. The evidence
+directory contains only the original archive and package parts under `parts/`.
 
 For library use:
 
@@ -77,9 +82,14 @@ For library use:
 from pptx_forensics import extract_pptx
 
 report = extract_pptx("input.pptx", evidence_dir="evidence/input")
-payload = report.to_dict()
-print(report.to_canonical_json())
+payload = report.to_semantic_dict()
+print(report.to_markdown())
 ```
+
+`to_semantic_dict()` and `to_semantic_json()` contain document semantics only.
+The full working DeckIR is available explicitly through `to_debug_dict()` and
+is used by the optional evaluation code; it is not written to the Markdown
+report.
 
 Use `--native-only` when only package, slide, object, asset, and relationship
 facts are required.
@@ -248,37 +258,45 @@ from pptx_forensics import evaluate_report
 metrics = evaluate_report(report, labels)
 ```
 
-## DeckIR Output
+## Semantic Output
 
-`ExtractionReport.to_dict()` and `manifest.json` use the DeckIR v1 contract:
+`ExtractionReport.to_markdown()` is the consumer-facing report. The related
+semantic dictionary and JSON methods use the same compact projection:
 
 ```json
 {
   "schema_version": "1.0",
   "deck": {},
+  "summary": {},
   "slides": [],
   "objects": [],
   "assets": [],
   "relationships": [],
   "visual_regions": [],
-  "rendered_evidence": [],
-  "ocr_evidence": [],
-  "vision_evidence": [],
-  "warnings": [],
-  "provenance": {}
+  "diagrams": [],
+  "ocr": [],
+  "vision": [],
+  "comments": [],
+  "warnings": []
 }
 ```
 
-Native objects use the `native_ooxml` source layer. Derived records are kept in
-`visual_regions`, `rendered_evidence`, `ocr_evidence`, and `vision_evidence`.
-They contain source, confidence, status, and evidence references. The schema
-validator rejects unsupported versions, missing required fields, invalid
-statuses, and derived records without provenance.
+Objects retain IDs, slide IDs, type, normalized `bbox`, text, z-order, concise
+style properties, relationships, a simplified source, semantic status, and
+final confidence. Diagram nodes and edges retain their normalized positions,
+labels, direction, status, and actual flow. OCR retains extracted text,
+optional line positions, status, and final confidence. Vision retains its
+description, observations, nodes, edges, status, and final confidence.
 
-Slides expose `slide_reading_order`, `diagram_flow_direction`, `flow_present`,
-and `flow_presence_basis` separately. `flow_present` is `true` only when flow
-evidence exists, `false` only with a supported absence basis, and `null` when
-absence cannot be established.
+Hashes, raw/resolved style payloads, EMU geometry, XML paths, evidence
+references, OCR word arrays, model and engine metadata, request telemetry,
+failure classifications, missing-evidence lists, detector flow candidates, and
+intermediate raster detections are intentionally excluded from this output.
+
+`DeckIR.to_dict()` and `to_canonical_json()` remain the full internal contract
+for deterministic pipeline checks. They are not the consumer-facing report.
+Semantic slides expose a single `flow` object with `present` and `direction`,
+instead of detector-level flow fields.
 
 ## Security And Privacy
 
@@ -300,10 +318,9 @@ pytest -q
 
 The suite includes a synthetic package, adversarial XML/ZIP cases, deterministic
 visual evidence tests, OCR caching tests, diagram uncertainty tests, Gemini
-schema/retry tests, evaluation metrics, and an LLVM golden report.
+schema/retry tests, evaluation metrics, and a golden regression report.
 
-The current suite passes 38 tests. The LLVM fixture contains 17 slides, 634
-native objects, 37 assets, and 118 relationships.
+The current suite passes 40 tests.
 
 ## Repository Layout
 
@@ -311,6 +328,7 @@ native objects, 37 assets, and 118 relationships.
 src/pptx_forensics/
   extractor.py       Native OOXML extraction
   models.py          DeckIR contract and validation
+  output.py          Semantic projection and Markdown output
   visual.py          Deterministic visual evidence
   ocr.py             Asset-scoped OCR
   diagrams.py        Native and raster diagram evidence
