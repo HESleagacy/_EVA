@@ -22,6 +22,7 @@ from .evaluation import (
     word_precision_recall,
 )
 from .vision import GeminiVisionAdapter, VisionAdapter, VisionImage, run_selective_vision, validate_vision_payload
+from .output import SEMANTIC_SCHEMA_VERSION, render_markdown, render_semantic_json, semantic_dict
 
 __all__ = [
     "DeckIR",
@@ -51,6 +52,10 @@ __all__ = [
     "VisionImage",
     "run_selective_vision",
     "validate_vision_payload",
+    "SEMANTIC_SCHEMA_VERSION",
+    "semantic_dict",
+    "render_markdown",
+    "render_semantic_json",
     "load_dotenv",
     "classify_image_role",
     "bbox_iou",

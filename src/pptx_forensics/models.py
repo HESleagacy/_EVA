@@ -162,6 +162,24 @@ class DeckIR:
             "provenance": self.provenance,
         }
 
+    def to_semantic_dict(self) -> dict[str, Any]:
+        """Return the compact document-semantic projection for consumers."""
+        from .output import semantic_dict
+
+        return semantic_dict(self)
+
+    def to_semantic_json(self) -> str:
+        """Return deterministic JSON without parser internals or telemetry."""
+        from .output import render_semantic_json
+
+        return render_semantic_json(self)
+
+    def to_markdown(self) -> str:
+        """Return a descriptive Markdown document containing parsed semantics."""
+        from .output import render_markdown
+
+        return render_markdown(self)
+
     def to_canonical_json(self) -> str:
         """Return deterministic JSON suitable for hashes and golden files."""
         return json.dumps(
@@ -319,6 +337,21 @@ class ExtractionReport:
     canonical: DeckIR | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        """Return the full DeckIR contract used by pipeline diagnostics."""
+        if self.canonical is not None:
+            return self.canonical.to_dict()
+        return self.to_legacy_dict()
+
+    def to_semantic_dict(self) -> dict[str, Any]:
+        """Return the compact document-semantic projection for consumers."""
+        from .output import semantic_dict
+
+        if self.canonical is None:
+            return self.to_dict()
+        return semantic_dict(self)
+
+    def to_debug_dict(self) -> dict[str, Any]:
+        """Return the internal/full report for pipeline diagnostics and evaluation."""
         if self.canonical is not None:
             return self.canonical.to_dict()
         return self.to_legacy_dict()
@@ -329,7 +362,23 @@ class ExtractionReport:
         return payload
 
     def to_json(self) -> str:
+        from .output import render_semantic_json
+
+        if self.canonical is not None:
+            return render_semantic_json(self).rstrip("\n")
         return json.dumps(self.to_dict(), indent=2, sort_keys=True)
+
+    def to_semantic_json(self) -> str:
+        """Return the consumer-facing semantic JSON representation."""
+        return self.to_json()
+
+    def to_markdown(self) -> str:
+        """Return a descriptive Markdown document containing parsed semantics."""
+        from .output import render_markdown
+
+        if self.canonical is None:
+            raise ValueError("Markdown output requires a canonical DeckIR report")
+        return render_markdown(self)
 
     def to_canonical_json(self) -> str:
         if self.canonical is None:
