@@ -218,7 +218,7 @@ pptx-forensics input.pptx \
 
 When `--evidence-dir` is supplied without `--evaluation-output`, the sidecar is
 written to `evidence-dir/evaluation.json`. If neither path is supplied, metrics
-are printed to stderr so the canonical report remains valid JSON on stdout.
+are printed to stderr so the Markdown report remains the only stdout output.
 
 Annotation files are JSON objects with optional `ocr`, `diagrams`, and `vision`
 sections:
