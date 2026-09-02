@@ -180,6 +180,18 @@ class DeckIR:
 
         return render_markdown(self)
 
+    def to_evaluator_ir(self) -> Any:
+        """Return the compact scoring projection without parser internals."""
+        from .evaluator import build_evaluator_ir
+
+        return build_evaluator_ir(self)
+
+    def to_evaluator_dict(self) -> dict[str, Any]:
+        return self.to_evaluator_ir().to_dict()
+
+    def to_evaluator_json(self) -> str:
+        return self.to_evaluator_ir().to_json()
+
     def to_canonical_json(self) -> str:
         """Return deterministic JSON suitable for hashes and golden files."""
         return json.dumps(
@@ -379,6 +391,18 @@ class ExtractionReport:
         if self.canonical is None:
             raise ValueError("Markdown output requires a canonical DeckIR report")
         return render_markdown(self)
+
+    def to_evaluator_ir(self) -> Any:
+        """Return the compact scoring projection without parser internals."""
+        from .evaluator import build_evaluator_ir
+
+        return build_evaluator_ir(self)
+
+    def to_evaluator_dict(self) -> dict[str, Any]:
+        return self.to_evaluator_ir().to_dict()
+
+    def to_evaluator_json(self) -> str:
+        return self.to_evaluator_ir().to_json()
 
     def to_canonical_json(self) -> str:
         if self.canonical is None:
