@@ -83,6 +83,7 @@ from pptx_forensics import extract_pptx
 
 report = extract_pptx("input.pptx", evidence_dir="evidence/input")
 payload = report.to_semantic_dict()
+evaluator_input = report.to_evaluator_dict()
 print(report.to_markdown())
 ```
 
@@ -93,6 +94,157 @@ report.
 
 Use `--native-only` when only package, slide, object, asset, and relationship
 facts are required.
+
+## Full Run
+
+The complete workflow has four stages: native extraction, optional evidence
+generation, DeckIR export, and rubric evaluation. Native extraction is always
+local and deterministic. OCR, raster diagram analysis, rendering, and Gemini
+are separate stages with their own dependencies, caches, and failure states.
+
+### Prerequisites
+
+Install the package with the extras used by a full local run:
+
+```bash
+python -m pip install -e ".[pptx,test,ocr]"
+```
+
+The OCR stage also needs Tesseract. Rendering needs Bun and an Aurochs checkout:
+
+```bash
+sudo apt install tesseract-ocr
+./scripts/fetch_aurochs_renderer.sh
+```
+
+If rendering is not installed, omit the render options below. The extraction
+and evaluation stages still complete and record rendering as unavailable.
+
+### Extract Evidence
+
+Set the input and selected slide range once. Selecting all slides and all image
+assets is the fullest run, but OCR and raster analysis can be expensive for
+large or high-resolution decks. Use `--ocr-assets` and `--diagram-assets` to
+bound those stages when needed.
+
+```bash
+SOURCE="input.pptx"
+SLIDES="1-20"
+EVIDENCE="evidence/input"
+
+pptx-forensics "$SOURCE" \
+  --evidence-dir "$EVIDENCE" \
+  --output "$EVIDENCE/report.md" \
+  --deck-ir-output "$EVIDENCE/deck-ir.json" \
+  --render-slides "$SLIDES" \
+  --aurochs-root "${AUROCHS_ROOT:-vendor/aurochs}" \
+  --render-cache-dir .cache/pptx-render \
+  --ocr-slides "$SLIDES" \
+  --ocr-cache-dir .cache/pptx-ocr \
+  --diagram-slides "$SLIDES" \
+  --diagram-ocr-cache-dir .cache/pptx-diagrams \
+  --skip-vision
+```
+
+This command produces the Markdown report, package evidence under `parts/`,
+rendered SVGs under `rendered/` when Aurochs is available, OCR records, native
+diagram evidence, and raster diagram candidates. Raster graph topology remains
+probabilistic evidence and is not included in deterministic rubric scoring.
+
+### Export DeckIR
+
+The `--deck-ir-output` option in the full command writes canonical DeckIR JSON
+after all selected evidence stages have completed. This preserves render, OCR,
+and diagram evidence in the same object that produced the Markdown report.
+
+The equivalent library export is:
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+from pptx_forensics import extract_pptx
+
+source = Path("input.pptx")
+evidence = Path("evidence/input")
+report = extract_pptx(source, evidence_dir=evidence)
+(evidence / "deck-ir.json").write_text(
+    json.dumps(report.to_dict(), indent=2), encoding="utf-8"
+)
+PY
+```
+
+When rendered or OCR evidence must be part of the DeckIR, invoke those library
+stages on the same `report` object before writing `report.to_dict()`. The CLI
+above is convenient for the Markdown report; the library object is the
+authoritative export boundary.
+
+### Evaluate Deck
+
+Run deterministic deck-quality scoring without external network calls:
+
+```bash
+evaluate-deck \
+  --deck-ir evidence/input/deck-ir.json \
+  --problem problem.json \
+  --skip-semantic \
+  --output evidence/input/evaluation.json
+```
+
+For a structural-only run when no problem statement exists:
+
+```bash
+evaluate-deck \
+  --deck-ir evidence/input/deck-ir.json \
+  --deck-only \
+  --output evidence/input/evaluation.json
+```
+
+The result contains all deterministic metrics and score records. Semantic
+component scores remain explicitly unavailable when `--skip-semantic`,
+`--deck-only`, or a missing Gemini key prevents model evaluation. Consequently,
+`final_score` is `null` unless both the `proposal_strength` and `deck_quality`
+groups have scores.
+
+### Semantic Run
+
+Provide a validated problem statement and opt into Gemini only when semantic
+evaluation is wanted. The evaluator supports only `gemini-2.5-flash`, caches
+validated responses, and cites supporting slide numbers:
+
+```bash
+export GEMINI_API_KEY="..."
+
+evaluate-deck \
+  --deck-ir evidence/input/deck-ir.json \
+  --problem problem.json \
+  --render-dir evidence/input/renders \
+  --semantic-cache-dir .cache/pptx-evaluation \
+  --output evidence/input/evaluation.json
+```
+
+`--render-dir` accepts raster slide images such as PNG or JPEG. Aurochs writes
+SVG evidence; provide rasterized slide images separately if Gemini should use
+rendered pixels. No model score is inferred when the request, response schema,
+or supporting evidence is unavailable.
+
+### Output Layout
+
+A full run commonly leaves this evidence bundle:
+
+```text
+evidence/input/
+  original.pptx
+  parts/              extracted package parts
+  rendered/           optional Aurochs SVGs
+  report.md           descriptive extraction report
+  deck-ir.json        canonical evaluator input
+  evaluation.json     deterministic and semantic score output
+```
+
+Cache directories should remain outside the evidence bundle or be ignored by
+version control. A failed optional stage is recorded in the report and does not
+invalidate native extraction.
 
 ## Command Line Usage
 
@@ -147,6 +299,7 @@ Raster detections are candidates, not proof. Missing OCR, unresolved endpoints,
 or zero verified edges keep the graph uncertain. Failure classes include
 `ocr_failure`, `text_mask_failure`, `line_detection_failure`,
 `arrowhead_failure`, `endpoint_matching_failure`, and `graph_assembly_failure`.
+The deck evaluator deliberately excludes these raster graph nodes and edges.
 
 ### Gemini Vision
 
@@ -258,6 +411,98 @@ from pptx_forensics import evaluate_report
 metrics = evaluate_report(report, labels)
 ```
 
+`evaluate_report()` remains the annotation-metric API for OCR, diagram, and
+vision evidence. It is separate from the rubric evaluator below and is useful
+for measuring extraction quality against labeled data.
+
+The evaluator projection is available directly:
+
+```python
+from pptx_forensics import evaluator_json
+
+print(evaluator_json(report))
+```
+
+## Evaluator Input
+
+`ExtractionReport.to_evaluator_dict()` and `to_evaluator_json()` expose the
+scoring boundary. The payload contains deck dimensions, deduplicated external
+links and media, plus slide number, rendered-image references, visible native
+text in reading order, text boxes, title candidates, slide metrics, tables, and
+meaningful image evidence. Raw relationships, notes, styles, OCR word arrays,
+raster graph data, and model telemetry remain outside this payload and can be
+followed through `raw_evidence_ref` values. Slide metrics include compact native
+geometry projections for occupied area, whitespace, empty regions, and
+meaningful visual area; the raw rendered evidence records remain outside the
+scoring payload.
+
+## Deck Evaluation
+
+The rubric evaluator consumes canonical DeckIR JSON and produces deterministic
+deck-quality metrics plus optional semantic proposal scores:
+
+```bash
+evaluate-deck \
+  --deck-ir evidence/input/deck-ir.json \
+  --problem problem.json \
+  --render-dir evidence/input/renders
+```
+
+Deterministic rubric metrics are recomputed from the supplied DeckIR on every
+invocation. The output includes `rubric_version` and an
+`evaluation_fingerprint`, which changes when the deck, problem statement,
+rubric inputs, or semantic result changes; a previous evaluation JSON is never
+used as the score source. Semantic responses are content-addressed and cached
+by default so repeated evaluations of unchanged evidence remain consistent.
+Use `--fresh-semantic` when a new Gemini response is explicitly required; this
+bypasses the semantic cache and requires the configured API key.
+
+Create the canonical input from the library when needed:
+
+```python
+import json
+from pathlib import Path
+from pptx_forensics import extract_pptx
+
+report = extract_pptx("input.pptx")
+Path("evidence/input/deck-ir.json").write_text(
+    json.dumps(report.to_dict(), indent=2), encoding="utf-8"
+)
+```
+
+Use `--deck-only` when no problem statement is available. Deck quality is still
+reported, while proposal alignment and other semantic scores remain explicitly
+unavailable. Gemini semantic scoring uses only `gemini-2.5-flash`; without
+`GEMINI_API_KEY`, semantic score fields remain `null` and no network request is
+made.
+
+The output records `title_coverage`, `text_density`, `small_text_ratio`,
+`overlap_ratio`, `clipping_rate`, `content_density_variation`,
+`slide_type_coverage`, `evidence_visibility`, duplicate-content ratio, and
+link/prototype evidence. It also measures `paragraph_content_ratio`,
+`pointer_content_ratio`, `paragraph_heavy_slide_ratio`,
+`ambiguous_claim_ratio`, `visual_coverage`, `whitespace_area_ratio`,
+`largest_empty_region_ratio`, and `space_usage`. Long paragraph-like blocks
+are scored separately from concise pointer-like blocks, and meaningful visual
+area is used instead of raw image counts so decorative assets cannot satisfy
+the visual criterion. Excess whitespace above 35% or a single empty region
+above 20% reduces `space_usage`.
+
+The final score is available only when both weighted groups have scores:
+
+`final_score = 0.70 * proposal_strength + 0.30 * deck_quality`.
+
+Each distinct missing-evidence item applies a 15-point penalty to its scored
+component. Weighted groups expose the original score and total penalty in
+`unpenalized_score` and `missing_evidence_penalty`.
+
+Every evaluation also contains a `findings` dictionary with `strengths`,
+`weaknesses`, and `ambiguous_points`. Findings cite slide numbers and the
+metric or semantic component that produced them. Missing semantic evidence is
+reported as an incomplete explanation and receives the existing component
+penalty; unresolved semantic evaluation is reported as ambiguous rather than
+being guessed.
+
 ## Semantic Output
 
 `ExtractionReport.to_markdown()` is the consumer-facing report. The related
@@ -317,10 +562,8 @@ pytest -q
 ```
 
 The suite includes a synthetic package, adversarial XML/ZIP cases, deterministic
-visual evidence tests, OCR caching tests, diagram uncertainty tests, Gemini
-schema/retry tests, evaluation metrics, and a golden regression report.
-
-The current suite passes 40 tests.
+visual evidence tests, OCR caching tests, diagram uncertainty tests,
+Gemini schema/retry tests, evaluator-boundary tests, and evaluation metrics.
 
 ## Repository Layout
 
@@ -328,6 +571,9 @@ The current suite passes 40 tests.
 src/pptx_forensics/
   extractor.py       Native OOXML extraction
   models.py          DeckIR contract and validation
+  evaluator.py       Compact scoring input projection
+  deck_evaluation.py Rubric metrics and optional semantic scoring
+  evaluate_cli.py    Deck evaluation command line interface
   output.py          Semantic projection and Markdown output
   visual.py          Deterministic visual evidence
   ocr.py             Asset-scoped OCR
@@ -336,14 +582,15 @@ src/pptx_forensics/
   evaluation.py      Annotation-based metrics
   render.py          Optional Aurochs rendering
   cli.py             Command-line interface
-tests/               Regression and benchmark tests
+tests/               Regression tests
 renderers/           Renderer runner integrations
 scripts/             Optional renderer bootstrap scripts
 ```
 
-Native extraction is production-oriented. Raster semantic recovery and Gemini
-interpretation remain probabilistic and should be evaluated against labeled
-data before being treated as production-grade quality judgments.
+Native extraction is production-oriented. Raster graph and Gemini results remain
+probabilistic evidence; the deck evaluator excludes raster graph topology from
+deterministic quality scoring and requires explicit evidence for semantic
+judgments.
 
 ## License
 
