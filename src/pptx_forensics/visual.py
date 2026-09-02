@@ -34,7 +34,7 @@ Matrix = tuple[float, float, float, float, float, float]
 IDENTITY: Matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
 _FOOTER_PLACEHOLDERS = {"ftr", "footer", "hdr", "header", "dt", "date", "sldnum", "slidenum", "slide_number"}
-_BADGE_TERMS = {"badge", "logo", "watermark", "hackathon", "sih", "team id", "team name", "point blank"}
+_BADGE_TERMS = {"badge", "logo", "watermark", "team id", "team name"}
 _TITLE_NOISE_TERMS = {"template", "placeholder", "watermark", "footer", "header", "logo", "badge"}
 _PAGE_NUMBER = re.compile(r"^(?:(?:page|slide)\s*)?\d+(?:\s*(?:/|of)\s*\d+)?$")
 _ROLE_KEYWORDS = {
@@ -42,7 +42,7 @@ _ROLE_KEYWORDS = {
     "screenshot": ("screenshot", "screen shot", "screen", "terminal", "browser", "desktop", "ui"),
     "chart": ("chart", "graph", "plot", "histogram", "bar", "line graph", "pie"),
     "evidence_image": ("evidence", "result", "output", "capture", "proof", "error", "log", "trace"),
-    "logo": ("logo", "watermark", "brand", "hackathon", "sih", "point blank"),
+    "logo": ("logo", "watermark", "brand"),
     "decorative_image": ("decorative", "decoration", "ornament", "pattern", "background", "icon"),
 }
 

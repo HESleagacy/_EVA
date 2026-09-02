@@ -407,7 +407,7 @@ def _asset_noise_reasons(
         reasons.append("repeated_full_slide_template_asset")
     if small and corner and word_count <= 2 and edge_count == 0:
         reasons.append("decorative_or_logo_asset")
-    if small and corner and any(term in ocr_text for term in ("smart india", "hackathon", "sih")):
+    if small and corner and any(term in ocr_text for term in ("logo", "watermark", "brand")):
         reasons.append("recognized_logo_or_watermark_text")
     if tiny and word_count <= 3 and edge_count == 0:
         reasons.append("tiny_low_information_asset")
@@ -479,16 +479,14 @@ def _is_noise_node(node: dict[str, Any]) -> bool:
     if not label:
         return False
     page_label = label.removeprefix("page ").removeprefix("slide ").strip(" -:#")
-    if label.isdigit() or page_label.isdigit() or any(term in label for term in ("logo", "watermark", "page number", "slide number", "hackathon")):
-        return True
-    if label in {"point blank", "smart india hackathon 2025"}:
+    if label.isdigit() or page_label.isdigit() or any(term in label for term in ("logo", "watermark", "page number", "slide number")):
         return True
     bbox = _round_bbox(node.get("bbox"))
     if bbox is None:
         return False
     left, top, width, height = bbox
     near_edge = left <= 0.08 or top <= 0.08 or left + width >= 0.92 or top + height >= 0.92
-    return near_edge and len(label) <= 24 and any(term in label for term in ("blank", "india", "point", "2025"))
+    return near_edge and len(label) <= 24 and any(term in label for term in ("brand", "template", "footer"))
 
 
 def _conservatize_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
