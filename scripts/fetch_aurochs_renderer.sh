@@ -32,4 +32,7 @@ if ! command -v bun >/dev/null 2>&1; then
   exit 0
 fi
 
-bun --cwd "$root" install --frozen-lockfile
+# The Python bridge only imports Aurochs' PPTX/SVG packages; Puppeteer's browser
+# is used by unrelated workspace tooling and is not required for rendering.
+PUPPETEER_SKIP_DOWNLOAD="${PUPPETEER_SKIP_DOWNLOAD:-1}" \
+  bun install --cwd "$root" --frozen-lockfile
