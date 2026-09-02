@@ -37,6 +37,234 @@ without allowing derived results to overwrite native facts.
 - Optional stages are explicit and never required for native extraction.
 - Canonical output is deterministic and suitable for hashing and golden tests.
 
+## Operations Guide
+
+### Runtime Model
+
+`pptx-forensics` is a batch processor. Each CLI invocation reads one PPTX and
+writes a report and optional evidence files; the repository does not include a
+web server, worker queue, database, container image, or telemetry backend.
+Applications that need an API or queue should wrap the CLI or library and own
+job scheduling, authentication, quotas, and retention.
+
+The processing path is:
+
+```text
+PPTX input
+  -> native OOXML extraction (local and deterministic)
+  -> optional rendering, OCR, diagram, and vision stages
+  -> DeckIR, Markdown report, evidence bundle, and optional evaluation JSON
+```
+
+Use a unique evidence directory for every job. The extractor copies the source
+PPTX and all package parts into that directory, so an evidence directory is
+both an output location and a copy of the input. Do not let concurrent jobs
+write to the same evidence directory.
+
+The native extractor reads the source archive into memory and retains package
+and derived records in the process. Set upload-size, memory, CPU, timeout, and
+temporary-storage limits in the surrounding service or job runner; the package
+does not impose those resource quotas itself.
+
+### Stage Matrix
+
+| Stage | Required | Runtime dependencies | Network at runtime | Failure behavior |
+| --- | --- | --- | --- | --- |
+| Native OOXML extraction | Yes | Python, `defusedxml`, `lxml` | None | Invalid input exits non-zero |
+| Native visual and diagram evidence | Default, disable with `--native-only` | Python package | None | Evidence is marked uncertain or warnings are recorded |
+| OCR | Optional | Pillow and Tesseract | None | Record becomes unavailable or failed; extraction continues |
+| Aurochs rendering | Optional | Bun and sparse Aurochs checkout | None after setup | Warning and failed render visibility; native data remains |
+| Gemini vision | Optional | API key and outbound HTTPS | Gemini API | Unavailable, failed, or circuit-open evidence; no guessed result |
+| Deck rubric evaluation | Optional | `evaluate-deck` and DeckIR JSON | None with `--skip-semantic` or `--deck-only` | Input/configuration errors exit non-zero |
+| Gemini semantic evaluation | Optional | Valid problem statement and API key | Gemini API | Semantic status is recorded; scores remain unavailable when needed evidence is missing |
+
+Optional-stage failures do not invalidate a completed native extraction. Treat
+the status fields, `warnings`, `failure_class`, and evaluation `missing_evidence`
+fields as part of the operational result rather than relying only on the
+process exit code.
+
+### Deployment Profiles
+
+Use the smallest profile that satisfies the job:
+
+| Profile | Install | Use |
+| --- | --- | --- |
+| Deterministic CI extraction | `.[pptx]` | Native package facts and stable DeckIR with no external services |
+| Evidence worker | `.[pptx,ocr]` plus Tesseract; optionally Bun/Aurochs | OCR, rendering, and diagram evidence with local dependencies |
+| Semantic evaluator | `.[pptx]` plus a secret-managed Gemini key | Proposal scoring and optional rendered-image context |
+| Repository test job | `.[pptx,test,ocr]` | Unit and regression tests; Tesseract is only needed for OCR paths |
+
+For production, build a wheel in CI and install that artifact in an isolated
+runtime. The repository currently has no lockfile, Dockerfile, or CI workflow;
+pin the Python version and resolved dependency versions in the deployment
+system or an external constraints file.
+
+### Production Installation
+
+The editable install is convenient for development. A runtime image or host
+should install the built package instead:
+
+```bash
+python -m venv /opt/pptx-forensics/venv
+source /opt/pptx-forensics/venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install ".[pptx]"
+```
+
+Install the optional extras only in images or workers that use them:
+
+```bash
+python -m pip install ".[pptx,ocr]"
+sudo apt-get install -y tesseract-ocr
+```
+
+Keep the Aurochs checkout outside the Python package. The bootstrap script
+uses a sparse checkout and skips Puppeteer browser download by default because
+the SVG bridge does not require it:
+
+```bash
+./scripts/fetch_aurochs_renderer.sh
+```
+
+The script needs GitHub and package-registry access during image or host
+provisioning. It is not required for native extraction, OCR, or diagram
+processing.
+
+### Configuration And Secrets
+
+Configuration is intentionally small. Explicit function or CLI arguments take
+precedence over environment variables, and a local `.env` file only fills
+variables that are not already set in the environment. `.env` is suitable for
+local development only; use the workload identity or secret manager provided
+by the deployment platform in production.
+
+| Variable | Default | Used by | Operational meaning |
+| --- | --- | --- | --- |
+| `GEMINI_API_KEY` | None | Gemini vision and semantic evaluation | Secret; absence disables the corresponding optional stage |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini vision | Overrides the vision model; keep the semantic evaluator on its supported model |
+| `AUROCHS_ROOT` | None at runtime; bootstrap defaults to `vendor/aurochs` | Rendering | Path to the sparse Aurochs checkout |
+| `AUROCHS_BUN_COMMAND` | `bun` from `PATH` | Rendering | Optional Bun executable or command override |
+| `XDG_CACHE_HOME` | `~/.cache` | Render, OCR, vision, and evaluation caches | Base directory for default cache roots |
+| `OPENXML_VALIDATOR_COMMAND` | None | `validate_with_openxml_sdk()` | Optional local validator command; the PPTX path is appended to it |
+
+The example configuration is in `.env.example`:
+
+```bash
+cp .env.example .env
+# edit .env locally; never commit it or print it in CI logs
+```
+
+The CLI calls `load_dotenv()` and checks the current working directory and
+repository root. Environment variables already supplied by the process are
+never overwritten.
+
+### Storage And Caching
+
+There is no database or server-side application state. The two state classes
+are job evidence and local caches:
+
+| Location | Contents | Safe to remove |
+| --- | --- | --- |
+| `evidence/<job>/` | Original PPTX, package parts, reports, renders, and evidence records | Yes after retention requirements are met; it cannot be reconstructed without the input |
+| `$XDG_CACHE_HOME/pptx-forensics/render/` | Aurochs SVGs keyed by source, slide, and renderer version | Yes; the next render rebuilds it |
+| `$XDG_CACHE_HOME/pptx-forensics/ocr/` | Validated OCR results keyed by asset and OCR engine settings | Yes; the next OCR run rebuilds it |
+| `$XDG_CACHE_HOME/pptx-forensics/vision/` | Validated Gemini responses and usage metadata | Yes; deleting it may create new API calls and cost |
+| `$XDG_CACHE_HOME/pptx-forensics/evaluation/` | Validated semantic evaluation responses | Yes; deleting it may create a new semantic request |
+
+Explicit `--*-cache-dir` arguments override the default cache locations. Mount
+cache directories as writable persistent volumes when repeatability and API
+cost matter. Use isolated cache locations when different tenants or data
+classification boundaries must not share derived content. Cache keys include
+content and relevant engine/model versions, but caches are not an access
+control boundary.
+
+Evidence and caches can contain extracted text, images, OCR output, and model
+responses. Apply restrictive volume permissions, retention policies, and
+encryption appropriate to the input data. The `evidence/`, `*.pptx`, `.env`,
+and renderer checkout paths are ignored by this repository's Git configuration;
+that does not replace storage access controls.
+
+### Network, Egress, And Cost
+
+Native extraction, native visual evidence, OCR, diagram reconstruction, and
+evaluation with `--skip-semantic` or `--deck-only` can run without runtime
+network access. Aurochs setup requires source and package-registry access, but
+rendering itself runs locally after dependencies are installed.
+
+Gemini is the only runtime network integration. If it is enabled, allow
+outbound HTTPS to `generativelanguage.googleapis.com` and inject
+`GEMINI_API_KEY` without placing it in command arguments. Requests can include
+selected slide images and extracted text, so obtain approval for the relevant
+data boundary before enabling the stage.
+
+Vision requests default to a 30-second timeout, two retries, and a maximum of
+two concurrent requests. Select only the required slides or assets, use the
+cache, and monitor the emitted `estimated_cost_usd`, token usage, request
+duration, `cache_hit`, and `attempts` metadata. Cost estimates are indicative,
+not a billing record. Use `--skip-vision`, `--skip-semantic`, or `--deck-only`
+for an explicitly offline run.
+
+### CI/CD Checks
+
+Run these checks from a clean checkout. Use an isolated temporary directory for
+generated reports and evidence:
+
+```bash
+python -m pip install -e "[pptx,test,ocr]"
+python -m pip check
+python -m compileall -q src tests
+PYTHONPATH=src pytest -q
+pptx-forensics --help
+evaluate-deck --help
+git diff --check
+```
+
+For a deterministic smoke test, provide a fixture through `INPUT_PPTX`:
+
+```bash
+RUN_DIR="$(mktemp -d)"
+pptx-forensics "$INPUT_PPTX" \
+  --native-only \
+  --evidence-dir "$RUN_DIR/evidence" \
+  --output "$RUN_DIR/report.md" \
+  --deck-ir-output "$RUN_DIR/deck-ir.json"
+
+evaluate-deck \
+  --deck-ir "$RUN_DIR/deck-ir.json" \
+  --deck-only \
+  --output "$RUN_DIR/evaluation.json"
+
+test -s "$RUN_DIR/report.md"
+test -s "$RUN_DIR/deck-ir.json"
+test -s "$RUN_DIR/evaluation.json"
+```
+
+Do not make CI depend on a Gemini response for a pass/fail check unless the
+pipeline explicitly controls API credentials, egress, quota, model version,
+and cost. Prefer deterministic extraction and `--deck-only` evaluation for
+pull-request checks; run semantic scoring as a separately observable job.
+
+### Runbook And Troubleshooting
+
+- **Rendering is skipped:** confirm `AUROCHS_ROOT` points to the sparse checkout
+  and that Bun is available. Native extraction and the rest of the evidence
+  pipeline can still be accepted when rendering is optional.
+- **OCR is unavailable:** install Tesseract and the `ocr` extra, or treat the
+  recorded `not_applicable`/`failed` status as an explicit missing capability.
+- **Gemini is unavailable:** check secret injection, outbound DNS/HTTPS, model
+  access, timeout, and quota. The output remains valid with semantic scores
+  set to unavailable.
+- **A run is unexpectedly slow or large:** restrict slide and asset selectors,
+  use `--native-only` for the minimum path, and move caches/evidence to storage
+  with sufficient space.
+- **A result appears stale:** inspect `cache_hit`, `content_hash`, and
+  `evaluation_fingerprint`; remove the relevant cache or use
+  `--fresh-semantic` when a new semantic request is intentional.
+- **A job fails before producing a report:** classify it as an input or
+  configuration failure and retain stderr plus the command version. Optional
+  stage failures should instead be visible in report warnings and evidence
+  statuses.
+
 ## Installation
 
 The package requires Python 3.10 or newer.
