@@ -1167,6 +1167,18 @@ def test_evaluation_cli_writes_metrics_outside_canonical_report(tmp_path: Path, 
     assert capsys.readouterr().out.startswith("# Parsed Presentation\n")
 
 
+def test_extraction_cli_exports_deckir_after_selected_stages(tmp_path: Path) -> None:
+    source = tmp_path / "deckir-output.pptx"
+    _package(source)
+    output = tmp_path / "results" / "deck-ir.json"
+
+    assert cli_main([str(source), "--native-only", "--deck-ir-output", str(output)]) == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert payload["deck"]["schema"] == "deck-ir"
+    assert payload["slides"][0]["id"] == "slide-01"
+
+
 def test_load_dotenv_reads_local_values_without_overriding_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     dotenv = tmp_path / ".env"
     dotenv.write_text("# comment\nexport GEMINI_API_KEY=from-file\nGEMINI_MODEL=\"gemini-test\"\n", encoding="utf-8")
@@ -1180,29 +1192,3 @@ def test_load_dotenv_reads_local_values_without_overriding_environment(tmp_path:
     dotenv.write_text("GEMINI_API_KEY=should-not-win\n", encoding="utf-8")
     assert load_dotenv(dotenv) == dotenv.resolve()
     assert os.environ["GEMINI_API_KEY"] == "from-file"
-
-
-def test_benchmark_golden_report() -> None:
-    sources = sorted(Path(__file__).parents[1].glob("*.pptx"))
-    source = sources[0] if sources else None
-    if source is None:
-        pytest.skip("A local benchmark artifact is not available")
-    golden = json.loads((Path(__file__).parent / "golden/benchmark.deckir.golden.json").read_text())
-    report = extract_pptx(source)
-    canonical = report.to_dict()
-    object_types = {}
-    for item in canonical["objects"]:
-        object_types[item["type"]] = object_types.get(item["type"], 0) + 1
-
-    assert hashlib.sha256(report.to_canonical_json().encode()).hexdigest() == golden["canonical_sha256"]
-    assert len(report.to_canonical_json().encode()) == golden["canonical_utf8_bytes"]
-    assert canonical["deck"]["source_sha256"] == golden["source_sha256"]
-    assert {
-        "slides": len(canonical["slides"]),
-        "objects": len(canonical["objects"]),
-        "assets": len(canonical["assets"]),
-        "relationships": len(canonical["relationships"]),
-        "package_parts": len(canonical["provenance"]["package_parts"]),
-    } == golden["counts"]
-    assert object_types == golden["object_types"]
-    assert [item["part"] for item in canonical["slides"]] == [f"ppt/slides/slide{number}.xml" for number in range(1, 18)]

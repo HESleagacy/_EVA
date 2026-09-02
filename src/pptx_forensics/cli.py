@@ -23,6 +23,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("source", type=Path)
     parser.add_argument("--evidence-dir", type=Path, help="directory in which to retain original and package parts")
     parser.add_argument("--output", type=Path, help="write the Markdown report to this path; it must end in .md")
+    parser.add_argument("--deck-ir-output", type=Path, help="write the canonical DeckIR JSON after all selected evidence stages")
     parser.add_argument("--render-slides", help="render selected slides with Aurochs, e.g. 1,3-5")
     parser.add_argument("--aurochs-root", type=Path, help="sparse Aurochs checkout (or use AUROCHS_ROOT)")
     parser.add_argument("--render-cache-dir", type=Path, help="render cache directory")
@@ -145,6 +146,10 @@ def main(argv: list[str] | None = None) -> int:
                 evaluation_path.write_text(json.dumps(evaluation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             else:
                 print(json.dumps(evaluation, indent=2, sort_keys=True), file=sys.stderr)
+        if args.deck_ir_output is not None:
+            deck_ir_path = args.deck_ir_output.expanduser().resolve()
+            deck_ir_path.parent.mkdir(parents=True, exist_ok=True)
+            deck_ir_path.write_text(json.dumps(report.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     except ExtractionError as exc:
         parser.error(str(exc))
     output = report.to_markdown()
