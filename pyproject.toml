@@ -22,6 +22,7 @@ ocr = ["Pillow>=9.0"]
 [project.scripts]
 pptx-forensics = "pptx_forensics.cli:main"
 evaluate-deck = "pptx_forensics.evaluate_cli:main"
+rank-submissions = "pptx_forensics.rank_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

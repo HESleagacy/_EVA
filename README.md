@@ -473,6 +473,29 @@ SVG evidence; provide rasterized slide images separately if Gemini should use
 rendered pixels. No model score is inferred when the request, response schema,
 or supporting evidence is unavailable.
 
+### Batch Submission Ranking
+
+Use `rank-submissions` when several PPTX or PDF submissions target the same
+problem statement. Provide one validated weighted problem JSON for that group:
+
+```bash
+rank-submissions \
+  --input-dir submissions \
+  --problem problems/26168.json \
+  --output-dir reports
+```
+
+The command runs native extraction and the selected evidence stages for every
+submission, evaluates each deck against the same problem statement, ranks only
+submissions with a numeric final score, and places unavailable or failed cases
+in `REVIEW`. Use `--problem-dir` to resolve different problem JSON files by PS
+ID. The default buckets are `A - Excellent` (85-100), `B - Strong` (70-84.99),
+`C - Promising` (55-69.99), `D - Needs work` (below 55), and `REVIEW`.
+
+The output directory contains only Markdown files: one `report.md` per
+submission and one `ranking.md` grouped by PS. Intermediate DeckIR, evidence,
+and cache data are kept outside the output directory.
+
 ### Output Layout
 
 A full run commonly leaves this evidence bundle:

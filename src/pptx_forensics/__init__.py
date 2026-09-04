@@ -47,6 +47,19 @@ from .deck_evaluation import (
     validate_problem_statement,
     validate_semantic_payload,
 )
+from .ranking import (
+    BucketThresholds,
+    SubmissionResult,
+    assign_ranks,
+    bucket_for_score,
+    discover_sources,
+    infer_ps_id,
+    infer_team,
+    normalize_ps_id,
+    rank_submissions,
+    render_evaluation_markdown,
+    render_ranking_markdown,
+)
 
 __all__ = [
     "DeckIR",
@@ -120,4 +133,15 @@ __all__ = [
     "load_problem_statement",
     "validate_problem_statement",
     "validate_semantic_payload",
+    "BucketThresholds",
+    "SubmissionResult",
+    "assign_ranks",
+    "bucket_for_score",
+    "discover_sources",
+    "infer_ps_id",
+    "infer_team",
+    "normalize_ps_id",
+    "rank_submissions",
+    "render_evaluation_markdown",
+    "render_ranking_markdown",
 ]
