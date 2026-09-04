@@ -220,6 +220,8 @@ __marimo__/
 # Local project artifacts and credentials
 .env.*
 !.env.example
-evidence/
+evidence/*
+!evidence/**/
+!evidence/**/*.md
 vendor/aurochs/
 *.pptx
