@@ -1,4 +1,4 @@
-"""Command-line interface for PPTX forensic extraction."""
+"""Command-line interface for native PPTX and PDF forensic extraction."""
 
 from __future__ import annotations
 
@@ -8,25 +8,26 @@ import os
 from pathlib import Path
 import sys
 
-from .extractor import ExtractionError, extract_pptx
+from .extractor import ExtractionError, extract_document
 from .config import load_dotenv
 from .diagrams import reconstruct_raster_diagrams
 from .evaluation import evaluate_report
 from .ocr import run_ocr
-from .render import parse_slide_range, render_selected_slides
-from .vision import run_selective_vision
+from .render import parse_slide_range, render_selected_pdf_pages, render_selected_slides
+from .vision import DEFAULT_MAX_OUTPUT_TOKENS, run_selective_vision
 
 
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
-    parser = argparse.ArgumentParser(description="Extract a PPTX as an OOXML forensic package")
+    parser = argparse.ArgumentParser(description="Extract a PPTX or PDF as a native forensic document")
     parser.add_argument("source", type=Path)
-    parser.add_argument("--evidence-dir", type=Path, help="directory in which to retain original and package parts")
+    parser.add_argument("--evidence-dir", type=Path, help="directory in which to retain the source and native evidence")
     parser.add_argument("--output", type=Path, help="write the Markdown report to this path; it must end in .md")
     parser.add_argument("--deck-ir-output", type=Path, help="write the canonical DeckIR JSON after all selected evidence stages")
-    parser.add_argument("--render-slides", help="render selected slides with Aurochs, e.g. 1,3-5")
+    parser.add_argument("--render-slides", help="render selected slides/pages, e.g. 1,3-5")
     parser.add_argument("--aurochs-root", type=Path, help="sparse Aurochs checkout (or use AUROCHS_ROOT)")
     parser.add_argument("--render-cache-dir", type=Path, help="render cache directory")
+    parser.add_argument("--pdf-render-dpi", type=int, default=144, help="PDF page render resolution when the source is a PDF")
     parser.add_argument("--ocr-slides", help="OCR image assets displayed on selected slides, e.g. 8-10")
     parser.add_argument("--ocr-assets", help="OCR selected asset IDs, e.g. asset-0016,asset-0029")
     parser.add_argument("--ocr-cache-dir", type=Path, help="OCR cache directory")
@@ -44,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--vision-timeout", type=float, default=30.0, help="Gemini request timeout in seconds")
     parser.add_argument("--vision-retries", type=int, default=2, help="Gemini retries per selected request")
     parser.add_argument("--vision-thinking-budget", type=int, default=1024, help="Gemini thinking token budget")
-    parser.add_argument("--vision-max-output-tokens", type=int, default=8192, help="Gemini output token limit")
+    parser.add_argument("--vision-max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS, help="Gemini output token limit")
     parser.add_argument("--vision-concurrency", type=int, default=2, help="maximum concurrent Gemini requests")
     parser.add_argument("--vision-include-noise", action="store_true", help="allow likely logos and template images through the vision gate")
     parser.add_argument("--skip-vision", action="store_true", help="do not run the optional Gemini vision stage")
@@ -58,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.output is not None and args.output.suffix.casefold() != ".md":
         parser.error("--output must end in .md")
     try:
-        report = extract_pptx(
+        report = extract_document(
             args.source,
             args.evidence_dir,
             include_visual_evidence=not args.native_only,
@@ -69,14 +70,27 @@ def main(argv: list[str] | None = None) -> int:
                 slides = parse_slide_range(args.render_slides)
             except ValueError as exc:
                 parser.error(str(exc))
-            render_selected_slides(
-                report,
-                args.source,
-                args.evidence_dir,
-                slides,
-                renderer_root=args.aurochs_root,
-                cache_dir=args.render_cache_dir,
-            )
+            if report.convenience.get("adapter") == "pdf":
+                try:
+                    render_selected_pdf_pages(
+                        report,
+                        args.source,
+                        args.evidence_dir,
+                        slides,
+                        cache_dir=args.render_cache_dir,
+                        dpi=args.pdf_render_dpi,
+                    )
+                except ValueError as exc:
+                    parser.error(str(exc))
+            else:
+                render_selected_slides(
+                    report,
+                    args.source,
+                    args.evidence_dir,
+                    slides,
+                    renderer_root=args.aurochs_root,
+                    cache_dir=args.render_cache_dir,
+                )
         if (args.ocr_slides or args.ocr_assets) and not args.skip_ocr:
             try:
                 ocr_slides = parse_slide_range(args.ocr_slides) if args.ocr_slides else None

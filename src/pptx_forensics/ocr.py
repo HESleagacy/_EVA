@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from io import BytesIO
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -63,6 +64,35 @@ class OcrResult:
     confidence: float | None
     error: str | None = None
     failure_class: str | None = None
+
+
+def _finite_payload(value: Any) -> bool:
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, dict):
+        return all(_finite_payload(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return all(_finite_payload(item) for item in value)
+    return True
+
+
+def _checked_result(result: Any) -> OcrResult:
+    if not isinstance(result, OcrResult):
+        raise TypeError("OCR adapter returned an invalid result")
+    if result.status not in {"ok", "ocr_unavailable", "ocr_failed"}:
+        raise ValueError("OCR adapter returned an invalid status")
+    if not isinstance(result.words, list) or not isinstance(result.lines, list):
+        raise ValueError("OCR adapter returned invalid collections")
+    if result.confidence is not None and (
+        isinstance(result.confidence, bool)
+        or not isinstance(result.confidence, (int, float))
+        or not math.isfinite(float(result.confidence))
+        or not 0 <= result.confidence <= 1
+    ):
+        raise ValueError("OCR adapter returned an invalid confidence")
+    if not _finite_payload(asdict(result)):
+        raise ValueError("OCR adapter returned non-finite values")
+    return result
 
 
 def _normalised_box(left: float, top: float, width: float, height: float, image_width: int, image_height: int) -> list[float]:
@@ -143,7 +173,15 @@ class TesseractOcrAdapter:
             try:
                 left, top, box_width, box_height = (float(columns[index]) for index in (6, 7, 8, 9))
                 confidence = float(columns[10]) / 100.0
-            except ValueError:
+            except (TypeError, ValueError):
+                continue
+            if (
+                not all(math.isfinite(value) for value in (left, top, box_width, box_height, confidence))
+                or box_width < 0
+                or box_height < 0
+                or width <= 0
+                or height <= 0
+            ):
                 continue
             word = {
                 "text": text,
@@ -217,6 +255,11 @@ def _asset_candidates(report: ExtractionReport, slides: Sequence[int] | None, mi
     return candidates
 
 
+def _pdf_asset_source(report: ExtractionReport) -> bool:
+    convenience = report.convenience if isinstance(report.convenience, dict) else {}
+    return convenience.get("adapter") == "pdf"
+
+
 def run_ocr(
     report: ExtractionReport,
     source: str | Path,
@@ -231,22 +274,52 @@ def run_ocr(
     """OCR displayed image assets only; never rasterize or OCR a full slide."""
     if skip or report.canonical is None:
         return []
+    if slides is not None:
+        available = {
+            item.get("number")
+            for item in report.canonical.slides
+            if isinstance(item.get("number"), int) and not isinstance(item.get("number"), bool)
+        }
+        valid_slides = []
+        for number in slides:
+            if isinstance(number, bool) or not isinstance(number, int) or number not in available:
+                report.warnings.append(f"OCR skipped unknown slide selection: {number!r}")
+                continue
+            valid_slides.append(number)
+        slides = sorted(set(valid_slides))
+        if not slides:
+            return []
     ocr_adapter = adapter or TesseractOcrAdapter()
     wanted = set(asset_ids or [])
     candidates = _asset_candidates(report, slides, min_dimension)
     cache_root = _cache_root(cache_dir)
-    cache_root.mkdir(parents=True, exist_ok=True)
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        report.warnings.append(f"OCR cache is unavailable: {exc}")
+        return []
     source_path = Path(source).expanduser().resolve()
     evidence: list[dict[str, Any]] = []
-
-    with zipfile.ZipFile(source_path) as archive:
+    archive = None
+    if not _pdf_asset_source(report):
+        try:
+            archive = zipfile.ZipFile(source_path)
+        except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+            report.warnings.append(f"OCR stage could not open source package: {exc}")
+            return evidence
+    try:
         for candidate in candidates:
             asset = candidate["asset"]
             if wanted and asset["id"] not in wanted:
                 continue
             try:
-                image = archive.read(asset["part"])
-            except (KeyError, OSError, RuntimeError) as exc:
+                if archive is not None:
+                    image = archive.read(asset["part"])
+                elif asset["id"] in report.asset_bytes_by_id:
+                    image = report.asset_bytes_by_id[asset["id"]]
+                else:
+                    raise KeyError(asset["id"])
+            except (KeyError, OSError, RuntimeError, zipfile.BadZipFile, NotImplementedError, EOFError, ValueError) as exc:
                 result = OcrResult("ocr_failed", "", [], [], None, None, None, str(exc))
                 cache_hit = False
                 key = _cache_key(asset["sha256"], ocr_adapter)
@@ -263,14 +336,24 @@ def run_ocr(
                 cache_hit = cached.is_file()
                 if cache_hit:
                     try:
-                        result = OcrResult(**json.loads(cached.read_text(encoding="utf-8")))
-                    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                        result = _checked_result(OcrResult(**json.loads(cached.read_text(encoding="utf-8"))))
+                    except (OSError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
                         cache_hit = False
                 if not cache_hit:
-                    result = ocr_adapter.recognize(image, asset["content_type"])
+                    try:
+                        result = _checked_result(ocr_adapter.recognize(image, asset.get("content_type", "application/octet-stream")))
+                    except Exception as exc:
+                        result = OcrResult("ocr_failed", "", [], [], None, None, None, str(exc))
                     if result.status == "ok":
-                        cached.write_text(json.dumps(asdict(result), sort_keys=True, separators=(",", ":")), encoding="utf-8")
+                        try:
+                            cached.write_text(json.dumps(asdict(result), sort_keys=True, separators=(",", ":"), allow_nan=False), encoding="utf-8")
+                        except (OSError, TypeError, ValueError) as exc:
+                            report.warnings.append(f"Could not write OCR cache for {asset['id']}: {exc}")
 
+            try:
+                result = _checked_result(result)
+            except Exception as exc:
+                result = OcrResult("ocr_failed", "", [], [], None, None, None, str(exc))
             first_object = candidate["objects"][0]
             evidence_status = _evidence_status(result.status)
             record = {
@@ -322,4 +405,7 @@ def run_ocr(
                     visibility = slide_record.setdefault("visual_evidence_visibility", {})
                     visibility["ocr"] = _merge_stage_status(visibility.get("ocr", "not_requested"), evidence_status)
             evidence.append(record)
+    finally:
+        if archive is not None:
+            archive.close()
     return evidence

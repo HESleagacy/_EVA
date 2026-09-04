@@ -1,16 +1,18 @@
-# PPTX Forensics
+# Document Forensics
 
-Forensic extraction and evidence generation for PowerPoint `.pptx` files.
+Forensic extraction and evidence generation for PowerPoint `.pptx` and PDF files.
 
-`pptx-forensics` reads a presentation as an OOXML package first and a slide
-deck second. It preserves the original package, extracts native structure and
-provenance, and adds optional OCR, diagram, rendering, and vision evidence
-without allowing derived results to overwrite native facts.
+`pptx-forensics` selects a native adapter from the input signature. PPTX files
+are read as OOXML packages and PDF files are read as PDF objects. It preserves
+the source structure and provenance, and adds optional OCR, diagram, rendering,
+and vision evidence without allowing derived results to overwrite native facts.
 
 ## What It Does
 
 - Extracts package parts, hashes, relationships, slide inheritance, media,
   notes, comments, hyperlinks, animations, alt text, and embedded parts.
+- Extracts PDF metadata, page boxes, rotation, labels, outlines, text spans,
+  image XObjects, vector paths, annotations, attachments, and security flags.
 - Extracts native objects with stable IDs, parent relationships, normalized
   geometry, z-order, text, styles, semantic projections, and XML provenance.
 - Produces deterministic visual evidence for occupancy, whitespace, margins,
@@ -27,13 +29,17 @@ without allowing derived results to overwrite native facts.
 
 ## Design Principles
 
-- Native OOXML is authoritative.
+- Native source facts are authoritative (`native_ooxml` for PPTX and
+  `native_pdf` for PDF).
 - Derived evidence is stored separately from native objects.
 - Every derived record includes status, confidence, source, and evidence
   references.
 - `verified`, `partial`, `unverified`, `failed`, `not_requested`, and
   `not_applicable` remain distinct states.
 - No unverified diagram edge is counted as a verified result.
+- A Gemini diagram may be promoted to `verified` only when it has non-noise
+  nodes, all returned nodes and edges are verified, and mean observation
+  confidence is at least `0.75`; native and raster records remain unchanged.
 - Optional stages are explicit and never required for native extraction.
 - Canonical output is deterministic and suitable for hashing and golden tests.
 
@@ -41,7 +47,7 @@ without allowing derived results to overwrite native facts.
 
 ### Runtime Model
 
-`pptx-forensics` is a batch processor. Each CLI invocation reads one PPTX and
+`pptx-forensics` is a batch processor. Each CLI invocation reads one PPTX or PDF and
 writes a report and optional evidence files; the repository does not include a
 web server, worker queue, database, container image, or telemetry backend.
 Applications that need an API or queue should wrap the CLI or library and own
@@ -50,30 +56,33 @@ job scheduling, authentication, quotas, and retention.
 The processing path is:
 
 ```text
-PPTX input
-  -> native OOXML extraction (local and deterministic)
+PPTX or PDF input
+  -> native source extraction (local and deterministic)
   -> optional rendering, OCR, diagram, and vision stages
   -> DeckIR, Markdown report, evidence bundle, and optional evaluation JSON
 ```
 
 Use a unique evidence directory for every job. The extractor copies the source
-PPTX and all package parts into that directory, so an evidence directory is
+and native evidence parts into that directory, so an evidence directory is
 both an output location and a copy of the input. Do not let concurrent jobs
 write to the same evidence directory.
 
-The native extractor reads the source archive into memory and retains package
-and derived records in the process. Set upload-size, memory, CPU, timeout, and
-temporary-storage limits in the surrounding service or job runner; the package
-does not impose those resource quotas itself.
+The native extractor reads the source bytes into memory and retains native and
+derived records in the process. The PDF adapter also applies defensive defaults
+of 256 MiB, 10,000 pages, and 500,000 native objects; callers can tighten those
+limits through the library API. Set upload-size, memory, CPU, timeout, and
+temporary-storage limits in the surrounding service or job runner as well.
 
 ### Stage Matrix
 
 | Stage | Required | Runtime dependencies | Network at runtime | Failure behavior |
 | --- | --- | --- | --- | --- |
 | Native OOXML extraction | Yes | Python, `defusedxml`, `lxml` | None | Invalid input exits non-zero |
+| Native PDF extraction | Yes for PDF input | Python, `pypdf` | None | Invalid input or missing password exits non-zero |
 | Native visual and diagram evidence | Default, disable with `--native-only` | Python package | None | Evidence is marked uncertain or warnings are recorded |
 | OCR | Optional | Pillow and Tesseract | None | Record becomes unavailable or failed; extraction continues |
 | Aurochs rendering | Optional | Bun and sparse Aurochs checkout | None after setup | Warning and failed render visibility; native data remains |
+| PDF page rendering | Optional | Poppler `pdftocairo` | None | Warning and failed render visibility; native data remains |
 | Gemini vision | Optional | API key and outbound HTTPS | Gemini API | Unavailable, failed, or circuit-open evidence; no guessed result |
 | Deck rubric evaluation | Optional | `evaluate-deck` and DeckIR JSON | None with `--skip-semantic` or `--deck-only` | Input/configuration errors exit non-zero |
 | Gemini semantic evaluation | Optional | Valid problem statement and API key | Gemini API | Semantic status is recorded; scores remain unavailable when needed evidence is missing |
@@ -90,7 +99,7 @@ Use the smallest profile that satisfies the job:
 | Profile | Install | Use |
 | --- | --- | --- |
 | Deterministic CI extraction | `.[pptx]` | Native package facts and stable DeckIR with no external services |
-| Evidence worker | `.[pptx,ocr]` plus Tesseract; optionally Bun/Aurochs | OCR, rendering, and diagram evidence with local dependencies |
+| Evidence worker | `.[pptx,ocr]` plus Tesseract; optionally Bun/Aurochs and Poppler | OCR, rendering, and diagram evidence with local dependencies |
 | Semantic evaluator | `.[pptx]` plus a secret-managed Gemini key | Proposal scoring and optional rendered-image context |
 | Repository test job | `.[pptx,test,ocr]` | Unit and regression tests; Tesseract is only needed for OCR paths |
 
@@ -282,7 +291,8 @@ python -m pip install -e ".[pptx,test,ocr]"
 ```
 
 The OCR extra installs Pillow. Tesseract must also be installed separately if
-the default Tesseract adapter is used.
+the default Tesseract adapter is used. PDF page rendering uses the optional
+local Poppler `pdftocairo` command.
 
 ## Quick Start
 
@@ -290,6 +300,12 @@ Write one descriptive Markdown report:
 
 ```bash
 pptx-forensics input.pptx --output report.md
+```
+
+The same command accepts a PDF:
+
+```bash
+pptx-forensics input.pdf --output report.md
 ```
 
 Use `--evidence-dir` when the original archive and package parts are also
@@ -301,15 +317,16 @@ pptx-forensics input.pptx \
   --output report.md
 ```
 
-Without `--output`, the Markdown report is printed to stdout. The evidence
-directory contains only the original archive and package parts under `parts/`.
+Without `--output`, the Markdown report is printed to stdout. PPTX evidence
+contains the original archive and package parts under `parts/`; PDF evidence
+also contains extracted native assets and per-page native records.
 
 For library use:
 
 ```python
-from pptx_forensics import extract_pptx
+from pptx_forensics import extract_document
 
-report = extract_pptx("input.pptx", evidence_dir="evidence/input")
+report = extract_document("input.pptx", evidence_dir="evidence/input")
 payload = report.to_semantic_dict()
 evaluator_input = report.to_evaluator_dict()
 print(report.to_markdown())
@@ -462,9 +479,11 @@ A full run commonly leaves this evidence bundle:
 
 ```text
 evidence/input/
-  original.pptx
-  parts/              extracted package parts
-  rendered/           optional Aurochs SVGs
+  original.pptx       or original.pdf
+  parts/              extracted package parts or document.pdf
+  pdf/assets/         extracted PDF image/attachment assets
+  pages/              per-page PDF native records
+  rendered/           optional Aurochs SVGs or PDF PNGs
   report.md           descriptive extraction report
   deck-ir.json        canonical evaluator input
   evaluation.json     deterministic and semantic score output
@@ -549,11 +568,12 @@ decorative images, badges, and template images are filtered unless
 `--vision-include-noise` is supplied. Without an API key, the optional stage
 records an unavailable result and makes no network request.
 
-Vision responses use strict `gemini-vision-v3` JSON. Model-only verified claims
-are downgraded, model-only edges remain `unverified`, and invalid JSON/schema
-responses are retried within the configured retry budget. Cache records retain
-the prompt/model/image hash, usage, estimated cost, duration, attempts, and
-sanitization metadata.
+Vision responses use strict `gemini-vision-v3` JSON. Valid model-only claims
+remain `partial` unless the response satisfies the high-confidence diagram
+promotion gate above; invalid JSON/schema responses are retried within the
+configured retry budget. Cache records retain the prompt/model/image hash,
+usage, estimated cost, duration, attempts, evidence status, and sanitization
+metadata.
 
 ## Deterministic Visual Evidence
 

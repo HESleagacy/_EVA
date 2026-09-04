@@ -5,12 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pptx-forensics"
 version = "0.1.0"
-description = "Forensic, package-aware extraction of PowerPoint PPTX files"
+description = "Forensic, native extraction of PowerPoint PPTX and PDF files"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "defusedxml>=0.7.1",
     "lxml>=4.9",
+    "pypdf>=5,<7",
 ]
 
 [project.optional-dependencies]
@@ -27,3 +28,4 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]

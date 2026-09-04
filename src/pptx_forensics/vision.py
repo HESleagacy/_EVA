@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import hashlib
 from io import BytesIO
 import json
+import math
 import os
 from pathlib import Path
 from time import perf_counter
@@ -28,14 +29,14 @@ from .config import load_dotenv
 
 
 VISION_SCHEMA_VERSION = "gemini-vision-v3"
-VISION_PROMPT_VERSION = "selective-gemini-v4"
+VISION_PROMPT_VERSION = "selective-gemini-v5"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_THINKING_BUDGET = 1024
-DEFAULT_MAX_OUTPUT_TOKENS = 8192
+DEFAULT_MAX_OUTPUT_TOKENS = 16384
 MAX_VISION_NODES = 128
 MAX_VISION_EDGES = 256
 MAX_VISION_OBSERVATIONS = 64
-MODEL_CONFIDENCE_CAP = 0.75
+MODEL_CONFIDENCE_THRESHOLD = 0.75
 GEMINI_INPUT_USD_PER_MILLION = 0.30
 GEMINI_OUTPUT_USD_PER_MILLION = 2.50
 LOW_OCR_CONFIDENCE = 0.65
@@ -102,6 +103,8 @@ def _merge_stage_status(previous: str, current: str) -> str:
         return current
     if previous == current:
         return current
+    if current == "verified" and previous in {"partial", "unverified"}:
+        return current
     if "failed" in {previous, current} and "verified" in {previous, current}:
         return "partial"
     if "not_applicable" in {previous, current}:
@@ -115,6 +118,23 @@ def _set_slide_visibility(deck: Any, slide_id: str, stage: str, status: str) -> 
         return
     visibility = slide.setdefault("visual_evidence_visibility", {})
     visibility[stage] = _merge_stage_status(visibility.get(stage, "not_requested"), status)
+
+
+def _selected_slide_numbers(deck: Any, slides: Sequence[int] | None, warnings: list[str]) -> list[int] | None:
+    if slides is None:
+        return None
+    available = {
+        item.get("number")
+        for item in deck.slides
+        if isinstance(item.get("number"), int) and not isinstance(item.get("number"), bool)
+    }
+    selected: list[int] = []
+    for number in slides:
+        if isinstance(number, bool) or not isinstance(number, int) or number not in available:
+            warnings.append(f"Vision skipped unknown slide selection: {number!r}")
+            continue
+        selected.append(number)
+    return sorted(set(selected))
 
 
 @dataclass(frozen=True)
@@ -285,11 +305,13 @@ def validate_vision_payload(payload: Any) -> tuple[bool, str]:
         return False, "vision response has unexpected or missing top-level fields"
     if payload["schema_version"] != VISION_SCHEMA_VERSION:
         return False, "vision response schema version is unsupported"
-    if payload["image_role"] not in IMAGE_ROLES:
+    if not isinstance(payload["image_role"], str) or payload["image_role"] not in IMAGE_ROLES:
         return False, "vision response has an invalid image role"
     if (
         not isinstance(payload["summary"], str)
+        or not isinstance(payload["slide_reading_order"], str)
         or payload["slide_reading_order"] not in READING_DIRECTIONS
+        or not isinstance(payload["diagram_flow_direction"], str)
         or payload["diagram_flow_direction"] not in READING_DIRECTIONS
         or (payload["flow_present"] is not None and not isinstance(payload["flow_present"], bool))
     ):
@@ -305,7 +327,7 @@ def validate_vision_payload(payload: Any) -> tuple[bool, str]:
         if not isinstance(node["id"], str) or not node["id"] or node["id"] in node_ids:
             return False, "vision node IDs must be unique non-empty strings"
         node_ids.add(node["id"])
-        if not isinstance(node["label"], str) or node["status"] not in VISION_STATUSES or not _valid_bbox(node["bbox"]):
+        if not isinstance(node["label"], str) or not isinstance(node["status"], str) or node["status"] not in VISION_STATUSES or not _valid_bbox(node["bbox"]):
             return False, "vision node fields are invalid"
     for edge in payload["edges"]:
         if not isinstance(edge, dict) or set(edge) != {"source", "target", "label", "direction", "status"}:
@@ -314,7 +336,7 @@ def validate_vision_payload(payload: Any) -> tuple[bool, str]:
             return False, "vision edge endpoints must be strings"
         if edge["source"] not in node_ids or edge["target"] not in node_ids:
             return False, "vision edge endpoints must reference returned nodes"
-        if edge["direction"] not in READING_DIRECTIONS or edge["status"] not in VISION_STATUSES or not isinstance(edge["label"], str):
+        if not isinstance(edge["direction"], str) or edge["direction"] not in READING_DIRECTIONS or not isinstance(edge["status"], str) or edge["status"] not in VISION_STATUSES or not isinstance(edge["label"], str):
             return False, "vision edge fields are invalid"
     for observation in payload["observations"]:
         if not isinstance(observation, dict) or set(observation) != {"type", "objects", "description", "confidence"}:
@@ -324,7 +346,7 @@ def validate_vision_payload(payload: Any) -> tuple[bool, str]:
         if not isinstance(observation["objects"], list) or not all(isinstance(item, str) for item in observation["objects"]):
             return False, "vision observation objects are invalid"
         confidence = observation["confidence"]
-        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not _finite_number(confidence) or not 0 <= confidence <= 1:
             return False, "vision observation confidence is invalid"
     return True, "ok"
 
@@ -333,8 +355,31 @@ def _valid_bbox(value: Any) -> bool:
     return (
         isinstance(value, list)
         and len(value) == 4
-        and all(isinstance(item, (int, float)) and not isinstance(item, bool) and 0 <= item <= 1 for item in value)
+        and all(
+            isinstance(item, (int, float))
+            and not isinstance(item, bool)
+            and _finite_number(item)
+            and 0 <= item <= 1
+            for item in value
+        )
     )
+
+
+def _finite_number(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _finite_payload(value: Any) -> bool:
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, dict):
+        return all(_finite_payload(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return all(_finite_payload(item) for item in value)
+    return True
 
 
 def _cache_root(cache_dir: str | Path | None) -> Path:
@@ -360,7 +405,7 @@ def _round_bbox(value: Any) -> list[float] | None:
         return None
     try:
         result = [round(float(item), 12) for item in value]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return result if all(item == item and abs(item) != float("inf") for item in result) else None
 
@@ -489,7 +534,11 @@ def _is_noise_node(node: dict[str, Any]) -> bool:
     return near_edge and len(label) <= 24 and any(term in label for term in ("brand", "template", "footer"))
 
 
-def _conservatize_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _conservatize_payload(
+    payload: dict[str, Any],
+    *,
+    preserve_confident_status: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Keep model interpretation probabilistic and remove obvious slide chrome."""
     role_noise = payload.get("image_role") in {"logo", "template", "decorative", "decorative_image"}
     removed_ids = {
@@ -503,7 +552,7 @@ def _conservatize_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], dict
         if node["id"] in removed_ids:
             continue
         item = dict(node)
-        if item["status"] == "verified":
+        if not preserve_confident_status and item["status"] == "verified":
             item["status"] = "partial"
             downgraded_nodes += 1
         nodes.append(item)
@@ -515,7 +564,7 @@ def _conservatize_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], dict
             removed_edges += 1
             continue
         item = dict(edge)
-        if item["status"] != "unverified":
+        if not preserve_confident_status and item["status"] != "unverified":
             item["status"] = "unverified"
         edges.append(item)
     observations = [dict(item) for item in payload["observations"]]
@@ -882,11 +931,13 @@ def _prompt(
     }
     return (
         "You are a forensic visual analyst. Interpret only the supplied slide or diagram images. "
-        "Native OOXML is authoritative; do not claim that a visual observation overwrites it. "
+        "Native source facts are authoritative; do not claim that a visual observation overwrites them. "
         "Treat OCR and heuristic diagram edges as evidence, not truth. "
         "Use native candidates only to cross-check labels and coordinates; never convert the candidate list itself into nodes. "
         "Do not include logos, page numbers, watermarks, or decorative/template elements as diagram nodes or edges; "
-        "report them only as observations. Never mark model-only nodes verified. "
+        "report them only as observations. Mark nodes or edges verified only when the supplied visual evidence is "
+        "unambiguous; otherwise use partial or unverified. The host applies an additional confidence gate before "
+        "promoting a complete model diagram to verified. "
         "Return exactly one JSON object matching the supplied schema, with no markdown and no extra fields. "
         "Use partial or unverified statuses whenever evidence is uncertain. "
         "Return slide_reading_order and diagram_flow_direction separately. Set flow_present to false only when "
@@ -907,8 +958,42 @@ def _content_hash(prompt: str, images: Sequence[VisionImage], metadata: dict[str
 
 
 def _payload_confidence(payload: dict[str, Any]) -> float | None:
-    values = [item["confidence"] for item in payload.get("observations", []) if isinstance(item, dict)]
-    return min(round(sum(values) / len(values), 6), MODEL_CONFIDENCE_CAP) if values else None
+    values = [
+        item["confidence"]
+        for item in payload.get("observations", [])
+        if isinstance(item, dict) and item.get("type") != "noise_filtered"
+    ]
+    return round(sum(values) / len(values), 6) if values else None
+
+
+def _can_promote_diagram(payload: Mapping[str, Any]) -> bool:
+    """Allow Gemini to verify only a complete, high-confidence diagram graph."""
+    nodes = payload.get("nodes")
+    edges = payload.get("edges")
+    confidence = _payload_confidence(dict(payload))
+    return bool(
+        payload.get("image_role") == "diagram"
+        and isinstance(nodes, list)
+        and nodes
+        and isinstance(edges, list)
+        and confidence is not None
+        and confidence >= MODEL_CONFIDENCE_THRESHOLD
+        and all(
+            isinstance(node, Mapping)
+            and node.get("status") == "verified"
+            and not _is_noise_node(dict(node))
+            for node in nodes
+        )
+        and all(isinstance(edge, Mapping) and edge.get("status") == "verified" for edge in edges)
+    )
+
+
+def _model_evidence_status(payload: Mapping[str, Any] | None, sanitization: Mapping[str, Any] | None) -> str:
+    if not isinstance(payload, Mapping) or not isinstance(sanitization, Mapping):
+        return "partial"
+    if any(sanitization.get(key, 0) for key in ("removed_noise_nodes", "removed_edges", "downgraded_nodes")):
+        return "partial"
+    return "verified" if _can_promote_diagram(payload) else "partial"
 
 
 def _estimated_cost_usd(usage: Any) -> float | None:
@@ -917,7 +1002,7 @@ def _estimated_cost_usd(usage: Any) -> float | None:
     try:
         prompt_tokens = int(usage.get("promptTokenCount", 0))
         output_tokens = int(usage.get("candidatesTokenCount", 0)) + int(usage.get("thoughtsTokenCount", 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if prompt_tokens < 0 or output_tokens < 0:
         return None
@@ -928,14 +1013,23 @@ def _estimated_cost_usd(usage: Any) -> float | None:
     )
 
 
-def _read_cache(path: Path, key: str) -> dict[str, Any] | None:
+def _read_cache(path: Path | None, key: str) -> dict[str, Any] | None:
+    if path is None:
+        return None
     try:
         cached = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(cached, dict):
+        return None
+    if not _finite_payload(cached):
         return None
     if cached.get("content_hash") != key or not isinstance(cached.get("analysis"), dict):
         return None
-    valid, _ = validate_vision_payload(cached["analysis"])
+    try:
+        valid, _ = validate_vision_payload(cached["analysis"])
+    except (TypeError, ValueError, OverflowError):
+        return None
     return cached if valid else None
 
 
@@ -948,6 +1042,7 @@ def _write_cache(
     request_seconds: float | None = None,
     attempts: int = 1,
     sanitization: dict[str, Any] | None = None,
+    evidence_status: str | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
@@ -961,10 +1056,12 @@ def _write_cache(
                 "request_seconds": request_seconds,
                 "attempts": attempts,
                 "sanitization": sanitization,
+                "evidence_status": evidence_status,
                 "estimated_cost_usd": _estimated_cost_usd(usage),
             },
             sort_keys=True,
             separators=(",", ":"),
+            allow_nan=False,
         ),
         encoding="utf-8",
     )
@@ -991,8 +1088,9 @@ def _vision_record(
     evidence_refs: list[dict[str, Any]],
     source: dict[str, Any],
     error: str | None = None,
+    evidence_status: str | None = None,
 ) -> dict[str, Any]:
-    evidence_status = _vision_evidence_status(status)
+    evidence_status = evidence_status or _vision_evidence_status(status)
     value = {
         "type": "gemini_vision_analysis",
         "status": evidence_status,
@@ -1096,17 +1194,25 @@ def _analyze_with_retries(
             valid, validation_error = validate_vision_payload(candidate)
             if not valid:
                 raise VisionRequestError(validation_error)
-            analysis, sanitization = _conservatize_payload(candidate)
+            preserve_confident_status = _can_promote_diagram(candidate)
+            analysis, sanitization = _conservatize_payload(
+                candidate,
+                preserve_confident_status=preserve_confident_status,
+            )
+            evidence_status = _model_evidence_status(analysis, sanitization)
+            usage = getattr(adapter, "last_usage", None)
+            usage = usage if _finite_payload(usage) else None
             return {
                 "status": "ok",
                 "error": None,
                 "analysis": analysis,
                 "response_sha256": hashlib.sha256(response_text.encode("utf-8")).hexdigest(),
-                "usage": getattr(adapter, "last_usage", None),
-                "estimated_cost_usd": _estimated_cost_usd(getattr(adapter, "last_usage", None)),
+                "usage": usage,
+                "estimated_cost_usd": _estimated_cost_usd(usage),
                 "request_seconds": round(perf_counter() - started, 6),
                 "attempts": attempts,
                 "sanitization": sanitization,
+                "evidence_status": evidence_status,
             }
         except Exception as exc:
             error = str(exc)
@@ -1118,8 +1224,10 @@ def _analyze_with_retries(
         "error": error,
         "analysis": None,
         "response_sha256": None,
-        "usage": getattr(adapter, "last_usage", None),
-        "estimated_cost_usd": _estimated_cost_usd(getattr(adapter, "last_usage", None)),
+        "usage": (getattr(adapter, "last_usage", None) if _finite_payload(getattr(adapter, "last_usage", None)) else None),
+        "estimated_cost_usd": _estimated_cost_usd(
+            getattr(adapter, "last_usage", None) if _finite_payload(getattr(adapter, "last_usage", None)) else None
+        ),
         "request_seconds": round(perf_counter() - started, 6),
         "attempts": attempts,
         "sanitization": None,
@@ -1157,7 +1265,15 @@ def run_selective_vision(
     load_dotenv()
     configured_model = model or os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
     deck = report.canonical
-    selected_slides = {f"slide-{number:02d}" for number in slides} if slides else set()
+    selected_slide_numbers = _selected_slide_numbers(deck, slides, report.warnings)
+    if slides is not None and not selected_slide_numbers:
+        return []
+    slide_ids_by_number = {
+        item["number"]: item["id"]
+        for item in deck.slides
+        if isinstance(item.get("number"), int) and not isinstance(item.get("number"), bool) and item.get("id")
+    }
+    selected_slides = {slide_ids_by_number[number] for number in selected_slide_numbers or []}
     selected_assets = set(asset_ids or [])
     objects_by_asset: dict[str, list[dict[str, Any]]] = {}
     objects_by_slide: dict[str, list[dict[str, Any]]] = {}
@@ -1167,26 +1283,42 @@ def run_selective_vision(
         if item.get("type") == "image" and item.get("asset_id"):
             objects_by_asset.setdefault(item["asset_id"], []).append(item)
     if run_ocr_stage and not skip_ocr:
-        run_ocr(report, source, slides=slides, asset_ids=asset_ids, cache_dir=ocr_cache_dir, skip=skip_ocr)
+        run_ocr(
+            report,
+            source,
+            slides=selected_slide_numbers,
+            asset_ids=asset_ids,
+            cache_dir=ocr_cache_dir,
+            skip=skip_ocr,
+        )
     ocr_by_asset = _ocr_by_asset(deck)
     deterministic_roles = _image_role_by_asset(deck)
     assets = {item.get("id"): item for item in deck.assets if item.get("id")}
     target_slides = set(selected_slides)
     if not target_slides:
-        target_slides = {
-            item["slide_id"]
-            for asset_id, items in objects_by_asset.items()
-            if not selected_assets or asset_id in selected_assets
-            for item in items
-        }
-        if not target_slides:
+        if selected_assets:
+            target_slides = {
+                item["slide_id"]
+                for asset_id, items in objects_by_asset.items()
+                if asset_id in selected_assets
+                for item in items
+            }
+        else:
             target_slides = {
                 slide_id
                 for slide_id, items in objects_by_slide.items()
                 if any(item.get("type") in {"image", "smartart"} for item in items)
             }
-    target_slides = {slide_id for slide_id in target_slides if slide_id in objects_by_slide or selected_slides}
+    if selected_assets and not target_slides:
+        report.warnings.append("Vision skipped unknown or non-image asset selection")
+        return []
+    target_slides = {slide_id for slide_id in target_slides if slide_id in objects_by_slide or slide_id in selected_slides}
     cache_root = _cache_root(cache_dir)
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        report.warnings.append(f"Vision cache is unavailable: {exc}")
+        cache_root = None
     vision_adapter = adapter or GeminiVisionAdapter(
         api_key=api_key,
         model=configured_model,
@@ -1198,7 +1330,15 @@ def run_selective_vision(
     results: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
     source_path = Path(source).expanduser().resolve()
-    with zipfile.ZipFile(source_path) as archive:
+    convenience = report.convenience if isinstance(report.convenience, dict) else {}
+    archive = None
+    if convenience.get("adapter") != "pdf":
+        try:
+            archive = zipfile.ZipFile(source_path)
+        except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+            report.warnings.append(f"Vision stage could not open source package: {exc}")
+            return results
+    try:
         for slide_id in sorted(target_slides):
             slide_objects = objects_by_slide.get(slide_id, [])
             slide_image_ids = sorted({item["asset_id"] for item in slide_objects if item.get("type") == "image" and item.get("asset_id")})
@@ -1269,8 +1409,11 @@ def run_selective_vision(
                         skipped_assets.setdefault(asset_id, []).append("unsupported_image_type")
                         continue
                     try:
-                        data = archive.read(asset["part"])
-                    except (KeyError, OSError, RuntimeError):
+                        if archive is not None:
+                            data = archive.read(asset["part"])
+                        else:
+                            data = report.asset_bytes_by_id[asset_id]
+                    except (KeyError, OSError, RuntimeError, zipfile.BadZipFile, NotImplementedError, EOFError, ValueError):
                         skipped_assets.setdefault(asset_id, []).append("asset_unavailable")
                         continue
                     images.append(VisionImage(f"asset:{asset_id}", mime_type, data))
@@ -1331,7 +1474,7 @@ def run_selective_vision(
             prompt = _prompt(slide_id, metadata, native, ocr_context, graph_values, facts)
             content_hash = _content_hash(prompt, images, metadata)
             metadata["content_hash"] = content_hash
-            cache_path = cache_root / f"{content_hash}.json"
+            cache_path = cache_root / f"{content_hash}.json" if cache_root is not None else None
             cached = _read_cache(cache_path, content_hash)
             if cached:
                 metadata["usage"] = cached.get("usage")
@@ -1339,6 +1482,8 @@ def run_selective_vision(
                 metadata["request_seconds"] = cached.get("request_seconds")
                 metadata["attempts"] = cached.get("attempts", 0)
                 metadata["sanitization"] = cached.get("sanitization")
+                evidence_status = _model_evidence_status(cached["analysis"], cached.get("sanitization"))
+                metadata["evidence_status"] = evidence_status
                 metadata["evidence_reconciliation"] = _reconcile_payload(cached["analysis"], native, ocr_context, graph_values)
                 metadata["evidence_grounding"] = _evidence_grounding(cached["analysis"], native, ocr_context, graph_values)
                 results.append(
@@ -1353,10 +1498,11 @@ def run_selective_vision(
                             analysis=cached["analysis"],
                             evidence_refs=vision_refs,
                             source={"model": getattr(vision_adapter, "version", configured_model), "adapter": getattr(vision_adapter, "name", "vision"), "prompt_version": VISION_PROMPT_VERSION, "cache_hit": True, "response_sha256": cached.get("response_sha256"), "usage": cached.get("usage"), "estimated_cost_usd": cached.get("estimated_cost_usd", _estimated_cost_usd(cached.get("usage"))), "request_seconds": cached.get("request_seconds"), "attempts": cached.get("attempts", 0)},
+                            evidence_status=evidence_status,
                         ),
                     )
                 )
-                _set_slide_visibility(deck, slide_id, "vision", "partial")
+                _set_slide_visibility(deck, slide_id, "vision", evidence_status)
                 continue
             if isinstance(vision_adapter, GeminiVisionAdapter) and not vision_adapter.api_key:
                 status, error, analysis = "unavailable", "GEMINI_API_KEY is not configured", None
@@ -1395,6 +1541,9 @@ def run_selective_vision(
                 )
             )
             _set_slide_visibility(deck, slide_id, "vision", _vision_evidence_status(status))
+    finally:
+        if archive is not None:
+            archive.close()
     if pending:
         worker_count = min(max(1, max_concurrency), len(pending))
         if not isinstance(vision_adapter, GeminiVisionAdapter):
@@ -1453,6 +1602,8 @@ def run_selective_vision(
             metadata["request_seconds"] = request_result["request_seconds"]
             metadata["attempts"] = request_result["attempts"]
             metadata["sanitization"] = request_result["sanitization"]
+            evidence_status = request_result.get("evidence_status") or _vision_evidence_status(status)
+            metadata["evidence_status"] = evidence_status
             metadata["evidence_reconciliation"] = _reconcile_payload(
                 analysis,
                 job["native"],
@@ -1465,17 +1616,21 @@ def run_selective_vision(
                 job["ocr"],
                 job["graphs"],
             )
-            if status == "ok":
-                _write_cache(
-                    job["cache_path"],
-                    job["content_hash"],
-                    analysis,
-                    request_result["response_sha256"],
-                    request_result["usage"],
-                    request_result["request_seconds"],
-                    request_result["attempts"],
-                    request_result["sanitization"],
-                )
+            if status == "ok" and job["cache_path"] is not None:
+                try:
+                    _write_cache(
+                        job["cache_path"],
+                        job["content_hash"],
+                        analysis,
+                        request_result["response_sha256"],
+                        request_result["usage"],
+                        request_result["request_seconds"],
+                        request_result["attempts"],
+                        request_result["sanitization"],
+                        evidence_status,
+                    )
+                except (OSError, TypeError, ValueError) as exc:
+                    report.warnings.append(f"Could not write vision cache for {job['slide_id']}: {exc}")
                 failures = 0
             else:
                 failures += 1
@@ -1494,10 +1649,11 @@ def run_selective_vision(
                         evidence_refs=job["evidence_refs"],
                         source={"model": getattr(vision_adapter, "version", configured_model), "adapter": getattr(vision_adapter, "name", "vision"), "prompt_version": VISION_PROMPT_VERSION, "cache_hit": False, "usage": metadata.get("usage"), "estimated_cost_usd": metadata.get("estimated_cost_usd"), "request_seconds": metadata.get("request_seconds"), "attempts": metadata.get("attempts", 0)},
                         error=request_result["error"],
+                        evidence_status=evidence_status,
                     ),
                 )
             )
-            _set_slide_visibility(deck, job["slide_id"], "vision", _vision_evidence_status(status))
+            _set_slide_visibility(deck, job["slide_id"], "vision", evidence_status)
     results.sort(key=lambda item: (item.get("slide_id", ""), item.get("id", "")))
     deck.vision_evidence.sort(key=lambda item: (item.get("slide_id", ""), item.get("id", "")))
     return results

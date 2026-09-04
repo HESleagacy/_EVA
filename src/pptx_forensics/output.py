@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import Counter
 import json
+import math
 from pathlib import PurePosixPath
 import re
 from typing import Any, Mapping
@@ -81,6 +82,7 @@ _DROP_TYPES = {
 }
 _DROP_SUFFIXES = ("_emu", "_sha256")
 _SLIDE_PART = re.compile(r"(?:^|/)slide(\d+)\.xml$")
+_PDF_PAGE_PART = re.compile(r"(?:^|:)page-(\d+)$")
 
 
 def _status(value: Any) -> str:
@@ -95,7 +97,7 @@ def _status(value: Any) -> str:
 def _confidence(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if not 0 <= value <= 1:
+    if not math.isfinite(float(value)) or not 0 <= value <= 1:
         return None
     return round(float(value), 6)
 
@@ -106,6 +108,8 @@ def _bbox(value: Any) -> list[float] | None:
     try:
         result = [round(float(item), 12) for item in value]
     except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(item) for item in result) or result[2] < 0 or result[3] < 0:
         return None
     return result
 
@@ -119,6 +123,7 @@ def _source_label(value: Any) -> str | None:
         return None
     return {
         "native_ooxml": "native",
+        "native_pdf": "native",
         "native": "native",
         "rendered_cv": "derived",
         "ocr": "ocr",
@@ -368,7 +373,8 @@ def _semantic_slide(
 
     graph_values = diagrams.get(slide_id, [])
     if graph_values:
-        present = any(item.get("flow", {}).get("present") is True for item in graph_values)
+        flow_values = [item.get("flow", {}).get("present") for item in graph_values]
+        present = True if any(value is True for value in flow_values) else False if any(value is False for value in flow_values) else None
         directions = [
             item.get("flow", {}).get("direction")
             for item in graph_values
@@ -376,16 +382,22 @@ def _semantic_slide(
         ]
         result["flow"] = {
             "present": present,
-            "direction": directions[0] if directions else "unknown" if present else "none",
+            "direction": directions[0] if directions else "unknown",
         }
     else:
-        result["flow"] = {"present": False, "direction": "none"}
+        result["flow"] = {
+            "present": slide.get("flow_present"),
+            "direction": slide.get("diagram_flow_direction") or "unknown",
+        }
     return result
 
 
 def _relationship_source(part: Any) -> str:
     value = str(part or "")
     match = _SLIDE_PART.search(value)
+    if match:
+        return f"slide-{int(match.group(1)):02d}"
+    match = _PDF_PAGE_PART.search(value)
     if match:
         return f"slide-{int(match.group(1)):02d}"
     if value.endswith("presentation.xml"):
@@ -523,11 +535,11 @@ def _semantic_diagram(record: Mapping[str, Any]) -> dict[str, Any] | None:
             | {"semantic_status": _node_status(group)}
         )
     original_present = value.get("flow_present")
-    present = bool(original_present) if original_present is not None else bool(edges)
+    present = original_present if isinstance(original_present, bool) else None
     direction = value.get("diagram_flow_direction")
     if direction in {None, "", "unknown"}:
         directions = [edge["direction"] for edge in edges if edge.get("direction") not in {None, "unknown"}]
-        direction = directions[0] if directions else "unknown" if present else "none"
+        direction = directions[0] if directions else "unknown"
     branch = value.get("branch", "native")
     if branch == "raster":
         diagram_id = f"diagram-{record.get('slide_id')}-{value.get('asset_id')}"
@@ -603,7 +615,7 @@ def _semantic_vision(record: Mapping[str, Any]) -> dict[str, Any] | None:
     direction = analysis.get("diagram_flow_direction", "unknown")
     if present is not None or direction not in {None, "", "unknown"}:
         result["flow"] = {
-            "present": bool(present) if present is not None else False,
+            "present": present if isinstance(present, bool) else None,
             "direction": direction if direction not in {None, ""} else "unknown",
         }
     nodes = []
@@ -745,14 +757,16 @@ def semantic_dict(value: Any) -> dict[str, Any]:
     ]
     semantic_relationships = [_semantic_relationship(item) for item in getattr(deck, "relationships", [])]
     type_counts = Counter(str(item.get("type", "unknown")) for item in semantic_objects)
+    deck_metadata = getattr(deck, "deck", {}) if isinstance(getattr(deck, "deck", {}), Mapping) else {}
+    source_format = deck_metadata.get("source_format")
     payload = {
         "schema_version": SEMANTIC_SCHEMA_VERSION,
         "deck": {
             "id": "deck",
-            "name": "Presentation",
-            "source": "presentation",
-            "slide_count": len(slides),
-            "slide_aspect_ratio": getattr(deck, "deck", {}).get("slide_aspect_ratio"),
+            "name": deck_metadata.get("name", "Presentation") if source_format == "pdf" else "Presentation",
+            "source": deck_metadata.get("source", "presentation") if source_format == "pdf" else "presentation",
+            "slide_count": deck_metadata.get("slide_count", len(slides)),
+            "slide_aspect_ratio": deck_metadata.get("slide_aspect_ratio"),
         },
         "summary": {
             "slides": len(slides),
@@ -775,6 +789,21 @@ def semantic_dict(value: Any) -> dict[str, Any]:
         "warnings": [str(value) for value in getattr(deck, "warnings", [])],
     }
     comments = _semantic_comments(report) if report is not None else []
+    if source_format:
+        payload["deck"]["source_format"] = source_format
+    if source_format == "pdf" and isinstance(deck_metadata.get("pdf"), Mapping):
+        pdf_metadata = deck_metadata["pdf"]
+        payload["deck"]["pdf"] = {
+            key: _clean(pdf_metadata[key])
+            for key in ("schema", "version", "page_count", "page_sizes_points", "security", "page_labels", "outlines", "attachments")
+            if key in pdf_metadata
+        }
+        if isinstance(pdf_metadata.get("metadata"), Mapping):
+            payload["deck"]["pdf"]["metadata"] = {
+                str(key): str(value)
+                for key, value in pdf_metadata["metadata"].items()
+                if value is not None
+            }
     payload["comments"] = comments
     return payload
 
@@ -919,10 +948,13 @@ def _append_diagram(lines: list[str], diagram: Mapping[str, Any]) -> None:
 def render_markdown(deck: Any) -> str:
     """Render a semantic DeckIR payload as a descriptive Markdown document."""
     payload = semantic_dict(deck)
+    source_format = payload["deck"].get("source_format")
+    title = "Parsed PDF" if source_format == "pdf" else "Parsed Presentation"
+    description = "This document lists the content and structure parsed from the PDF." if source_format == "pdf" else "This document lists the content and structure parsed from the presentation."
     lines = [
-        "# Parsed Presentation",
+        f"# {title}",
         "",
-        "This document lists the content and structure parsed from the presentation.",
+        description,
         "",
         "## Parsed Summary",
         "",
@@ -1099,4 +1131,4 @@ def render_markdown(deck: Any) -> str:
 
 def render_semantic_json(deck: Any) -> str:
     """Serialize the compact semantic payload for a JSON consumer."""
-    return json.dumps(semantic_dict(deck), indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    return json.dumps(semantic_dict(deck), indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n"

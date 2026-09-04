@@ -407,9 +407,14 @@ def _add_facts(deck: DeckIR, facts: Iterable[dict[str, Any]], prefix: str = "vis
     added: list[dict[str, Any]] = []
     counters: dict[str, int] = defaultdict(int)
     existing = {item.get("id"): item for item in deck.rendered_evidence}
+    native_layer = deck.provenance.get("native_layer", "native_ooxml")
     for item in facts:
         fact_type = item["value"]["type"]
         counters[fact_type] += 1
+        if item["value"].get("source") == "native_ooxml":
+            item["value"]["source"] = native_layer
+        if item.get("source", {}).get("authority") == "native_ooxml":
+            item["source"]["authority"] = native_layer
         record_id = f"{prefix}-{item['slide_id']}-{fact_type}-{counters[fact_type]:04d}"
         record = {
             "id": record_id,
@@ -612,6 +617,7 @@ def _add_visual_regions(
     exclusion_reasons: Mapping[str, list[str]] | None = None,
 ) -> None:
     """Create compact slide-level regions without duplicating every object box."""
+    native_layer = deck.provenance.get("native_layer", "native_ooxml")
     for slide in sorted(deck.slides, key=lambda item: (item.get("number", 0), item.get("id", ""))):
         slide_id = slide["id"]
         positioned = _layout_objects(objects_by_slide.get(slide_id, []), set(exclusion_reasons or {}))
@@ -631,7 +637,7 @@ def _add_visual_regions(
                 "type": "visual_region",
                 "region_kind": "content",
                 "coordinate_space": "slide_normalized",
-                "source": "native_ooxml",
+                "source": native_layer,
                 "status": "verified",
             },
             "status": "verified",
@@ -640,7 +646,7 @@ def _add_visual_regions(
             "source": {
                 "layer": "rendered_cv",
                 "method": "native_visual_region",
-                "authority": "native_ooxml",
+                "authority": native_layer,
                 "schema": VISUAL_SCHEMA_VERSION,
                 "status": "verified",
             },

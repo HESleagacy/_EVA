@@ -2,40 +2,56 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
 Matrix = tuple[float, float, float, float, float, float]
 IDENTITY: Matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+KNOWN_NAMESPACES = frozenset(
+    {
+        "http://schemas.openxmlformats.org/presentationml/2006/main",
+        "http://purl.oclc.org/ooxml/presentationml/main",
+        "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "http://purl.oclc.org/ooxml/drawingml/main",
+    }
+)
 
 
 def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+def _known_tag(tag: str) -> bool:
+    namespace = tag[1 : tag.index("}")] if tag.startswith("{") and "}" in tag else ""
+    return not namespace or namespace in KNOWN_NAMESPACES
+
+
 def _child(root: Any | None, name: str) -> Any | None:
     if root is None:
         return None
-    return next((item for item in list(root) if _local_name(item.tag) == name), None)
+    return next((item for item in list(root) if _local_name(item.tag) == name and _known_tag(item.tag)), None)
 
 
 def _descendant(root: Any | None, name: str) -> Any | None:
     if root is None:
         return None
-    return next((item for item in root.iter() if _local_name(item.tag) == name), None)
+    return next((item for item in root.iter() if _local_name(item.tag) == name and _known_tag(item.tag)), None)
 
 
 def _value(element: Any | None, attribute: str, default: float = 0.0) -> float:
     if element is None or element.get(attribute) is None:
         return default
     try:
-        return float(element.get(attribute))
+        value = float(element.get(attribute))
     except (TypeError, ValueError):
         return default
+    return value if math.isfinite(value) else default
 
 
 def _bool(element: Any | None, attribute: str) -> bool:
-    return bool(element is not None and element.get(attribute) in {"1", "true", "on"})
+    value = element.get(attribute) if element is not None else None
+    return str(value).casefold() in {"1", "true", "on"}
 
 
 def _multiply(outer: Matrix, inner: Matrix) -> Matrix:
@@ -100,6 +116,9 @@ def _transform_values(element: Any | None) -> dict[str, Any] | None:
         "flip_h": _bool(xfrm, "flipH"),
         "flip_v": _bool(xfrm, "flipV"),
     }
+    if any(value < 0 for value in values["extent_emu"]):
+        values["invalid_extent"] = True
+        values["extent_emu"] = [max(0.0, value) for value in values["extent_emu"]]
     # PresentationML stores group child offsets and extents as attributes on
     # separate elements.
     child_offset_element = _child(xfrm, "chOff")
@@ -108,6 +127,9 @@ def _transform_values(element: Any | None) -> dict[str, Any] | None:
         values["child_offset_emu"] = [_value(child_offset_element, "x"), _value(child_offset_element, "y")]
     if child_extent_element is not None:
         values["child_extent_emu"] = [_value(child_extent_element, "cx"), _value(child_extent_element, "cy")]
+        if any(value < 0 for value in values["child_extent_emu"]):
+            values["invalid_child_extent"] = True
+            values["child_extent_emu"] = [max(0.0, value) for value in values["child_extent_emu"]]
     return values
 
 
@@ -169,7 +191,10 @@ def _crop(element: Any) -> dict[str, float] | None:
     if source is None:
         return None
     attributes = {"left": "l", "top": "t", "right": "r", "bottom": "b"}
-    return {key: round(_value(source, attribute) / 100_000.0, 6) for key, attribute in attributes.items()}
+    values = {key: _value(source, attribute, math.nan) for key, attribute in attributes.items()}
+    if any(not math.isfinite(value) or not 0 <= value <= 100_000 for value in values.values()):
+        return None
+    return {key: round(value / 100_000.0, 6) for key, value in values.items()}
 
 
 def _placeholder(element: Any) -> dict[str, str] | None:
@@ -184,14 +209,14 @@ def _placeholder(element: Any) -> dict[str, str] | None:
     return result or None
 
 
-def _connector(element: Any, matrix: Matrix) -> dict[str, Any] | None:
+def _connector(element: Any, matrix: Matrix | None) -> dict[str, Any] | None:
     if _local_name(element.tag) != "cxnSp":
         return None
     properties = _child(element, "spPr")
     line = _child(properties, "ln")
     result: dict[str, Any] = {
-        "start_emu": _round_point(_apply(matrix, (0.0, 0.0))),
-        "end_emu": _round_point(_apply(matrix, (1.0, 1.0))),
+        "start_emu": _round_point(_apply(matrix, (0.0, 0.0))) if matrix is not None else None,
+        "end_emu": _round_point(_apply(matrix, (1.0, 1.0))) if matrix is not None else None,
     }
     connector_properties = _child(_child(element, "nvCxnSpPr"), "cNvCxnSpPr")
     if connector_properties is not None:
@@ -222,12 +247,15 @@ def geometry_for_object(
         transform_source = "inherited_placeholder"
     matrix = parent_matrix if values is None else _multiply(parent_matrix, _box_matrix(values))
     emu_bbox = _bbox(matrix) if values is not None else [0.0, 0.0, 0.0, 0.0]
-    normalized = [
-        round(emu_bbox[0] / slide_width, 12),
-        round(emu_bbox[1] / slide_height, 12),
-        round(emu_bbox[2] / slide_width, 12),
-        round(emu_bbox[3] / slide_height, 12),
-    ]
+    if math.isfinite(slide_width) and math.isfinite(slide_height) and slide_width > 0 and slide_height > 0:
+        normalized = [
+            round(emu_bbox[0] / slide_width, 12),
+            round(emu_bbox[1] / slide_height, 12),
+            round(emu_bbox[2] / slide_width, 12),
+            round(emu_bbox[3] / slide_height, 12),
+        ]
+    else:
+        normalized = [0.0, 0.0, 0.0, 0.0]
     geometry: dict[str, Any] = {
         "bbox_emu": [round(value, 6) for value in emu_bbox],
         "transform": values,
@@ -240,7 +268,7 @@ def geometry_for_object(
     placeholder = _placeholder(element)
     if placeholder is not None:
         geometry["placeholder"] = placeholder
-    connector = _connector(element, matrix)
+    connector = _connector(element, matrix if values is not None else None)
     if connector is not None:
         geometry["connector"] = connector
     return normalized, geometry

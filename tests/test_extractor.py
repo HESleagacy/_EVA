@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import zipfile
@@ -48,6 +49,15 @@ def _package(path: Path) -> bytes:
         for name, data in parts.items():
             archive.writestr(name, data)
     return path.read_bytes()
+
+
+def _rewrite_parts(path: Path, replacements: dict[str, bytes]) -> None:
+    with zipfile.ZipFile(path) as archive:
+        parts = {info.filename: archive.read(info) for info in archive.infolist() if not info.is_dir()}
+    parts.update(replacements)
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, data in parts.items():
+            archive.writestr(name, data)
 
 
 def _feature_package(path: Path) -> bytes:
@@ -752,6 +762,296 @@ def test_rejects_malformed_and_external_entity_xml(tmp_path: Path) -> None:
         extract_pptx(entity)
 
 
+def test_discovers_strict_packages_using_root_relationships_and_relationship_order(tmp_path: Path) -> None:
+    source = tmp_path / "strict.pptx"
+    package_namespace = "http://purl.oclc.org/ooxml/package/relationships"
+    office_namespace = "http://purl.oclc.org/ooxml/officeDocument/relationships"
+    main_namespace = "http://purl.oclc.org/ooxml/presentationml/main"
+    parts = {
+        "[Content_Types].xml": b'<Types xmlns="http://purl.oclc.org/ooxml/package/content-types"><Default Extension="xml" ContentType="application/xml"/><Override PartName="/custom/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/></Types>',
+        "_rels/.rels": f'<Relationships xmlns="{package_namespace}"><Relationship Id="rIdRoot" Type="http://purl.oclc.org/ooxml/officeDocument" Target="custom/presentation.xml"/></Relationships>'.encode(),
+        "custom/_rels/presentation.xml.rels": f'<Relationships xmlns="{package_namespace}"><Relationship Id="rIdSecond" Type="http://purl.oclc.org/ooxml/slide" Target="slides/second.xml"/><Relationship Id="rIdFirst" Type="http://purl.oclc.org/ooxml/slide" Target="slides/first.xml"/></Relationships>'.encode(),
+        "custom/presentation.xml": f'<p:presentation xmlns:p="{main_namespace}" xmlns:r="{office_namespace}"><p:sldIdLst><p:sldId id="1" r:id="rIdSecond"/><p:sldId id="2" r:id="rIdFirst"/></p:sldIdLst></p:presentation>'.encode(),
+        "custom/slides/first.xml": f'<p:sld xmlns:p="{main_namespace}"><p:cSld><p:spTree/></p:cSld></p:sld>'.encode(),
+        "custom/slides/second.xml": f'<p:sld xmlns:p="{main_namespace}"><p:cSld><p:spTree/></p:cSld></p:sld>'.encode(),
+    }
+    with zipfile.ZipFile(source, "w") as archive:
+        for name, data in parts.items():
+            archive.writestr(name, data)
+
+    report = extract_pptx(source, include_visual_evidence=False, include_native_diagrams=False)
+
+    assert [slide.part for slide in report.slides] == ["custom/slides/second.xml", "custom/slides/first.xml"]
+    assert not any("missing presentation" in warning.lower() for warning in report.warnings)
+
+
+def test_fallback_slide_order_is_numeric(tmp_path: Path) -> None:
+    source = tmp_path / "fallback.pptx"
+    main_namespace = "http://schemas.openxmlformats.org/presentationml/2006/main"
+    parts = {
+        "[Content_Types].xml": b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>',
+        "ppt/presentation.xml": f'<p:presentation xmlns:p="{main_namespace}"/>'.encode(),
+    }
+    for number in (1, 2, 10):
+        parts[f"ppt/slides/slide{number}.xml"] = f'<p:sld xmlns:p="{main_namespace}"><p:cSld><p:spTree/></p:cSld></p:sld>'.encode()
+    with zipfile.ZipFile(source, "w") as archive:
+        for name, data in parts.items():
+            archive.writestr(name, data)
+
+    report = extract_pptx(source, include_visual_evidence=False, include_native_diagrams=False)
+
+    assert [slide.part for slide in report.slides] == [
+        "ppt/slides/slide1.xml",
+        "ppt/slides/slide2.xml",
+        "ppt/slides/slide10.xml",
+    ]
+
+
+@pytest.mark.parametrize("part", ["ppt/charts/chart1.xml", "ppt/diagrams/data1.xml"])
+def test_malformed_chart_and_smartart_are_recorded_without_aborting(tmp_path: Path, part: str) -> None:
+    source = tmp_path / "malformed-semantic-part.pptx"
+    _feature_package(source)
+    _rewrite_parts(source, {part: b"<broken"})
+
+    report = extract_pptx(source, include_visual_evidence=False, include_native_diagrams=False)
+
+    object_type = "chart" if "chart" in part else "smartart"
+    item = next(item for item in report.to_dict()["objects"] if item["type"] == object_type)
+    assert item["semantic_status"] == "failed"
+    assert item["error"]
+
+
+def test_standard_direct_comment_text_and_text_layout_markers_are_preserved(tmp_path: Path) -> None:
+    source = tmp_path / "text-corners.pptx"
+    _package(source)
+    _rewrite_parts(
+        source,
+        {
+            "ppt/comments/comment1.xml": b'<p:cmLst xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cm authorId="9"><p:text>Direct comment</p:text></p:cm></p:cmLst>',
+            "ppt/slides/slide1.xml": b'''<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Text"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:txBody><a:p><a:r><a:t xml:space="preserve"> left </a:t></a:r><a:br/><a:r><a:t>right</a:t></a:r></a:p><a:p><a:r><a:t>second</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>''',
+        },
+    )
+
+    report = extract_pptx(source, include_visual_evidence=False, include_native_diagrams=False)
+
+    assert report.comments[0]["text"] == "Direct comment"
+    assert report.to_dict()["objects"][0]["text"] == " left \nright\nsecond"
+
+
+def test_invalid_dimensions_and_duplicate_zip_members_are_rejected(tmp_path: Path) -> None:
+    invalid_dimensions = tmp_path / "invalid-dimensions.pptx"
+    _feature_package(invalid_dimensions)
+    _rewrite_parts(
+        invalid_dimensions,
+        {
+            "ppt/presentation.xml": b'<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:sldSz cx="NaN" cy="1000"/></p:presentation>',
+        },
+    )
+    with pytest.raises(ExtractionError, match="Invalid slide dimensions"):
+        extract_pptx(invalid_dimensions)
+
+    duplicate = tmp_path / "duplicate.pptx"
+    with zipfile.ZipFile(duplicate, "w") as archive:
+        archive.writestr("ppt/presentation.xml", b"<p:presentation/>")
+        archive.writestr("ppt/presentation.xml", b"<p:presentation/>")
+    with pytest.raises(ExtractionError, match="Duplicate ZIP member"):
+        extract_pptx(duplicate)
+
+
+@pytest.mark.parametrize("member", ["./part.xml", "part/../part.xml", "C:/outside.xml"])
+def test_rejects_noncanonical_or_cross_platform_zip_member_names(tmp_path: Path, member: str) -> None:
+    source = tmp_path / "unsafe-member.pptx"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr(member, b"<root/>")
+
+    with pytest.raises(ExtractionError, match="Unsafe package part"):
+        extract_pptx(source)
+
+
+def test_semantic_flow_remains_unknown_without_diagram_evidence(tmp_path: Path) -> None:
+    source = tmp_path / "no-flow.pptx"
+    _package(source)
+
+    flow = extract_pptx(source).to_semantic_dict()["slides"][0]["flow"]
+
+    assert flow == {"direction": "unknown", "present": None}
+
+
+def test_relationship_uri_targets_are_decoded_and_external_modes_are_not_resolved(tmp_path: Path) -> None:
+    source = tmp_path / "relationship-targets.pptx"
+    _feature_package(source)
+    _rewrite_parts(
+        source,
+        {
+            "ppt/slides/_rels/slide1.xml.rels": b'''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdLayout" Type="/slideLayout" Target="../slideLayouts/slideLayout%31.xml?ignored"/><Relationship Id="rIdImage" Type="/image" Target="../media/image%31.png"/><Relationship Id="rIdLink" Type="/hyperlink" Target=" https://example.test " TargetMode=" External "/></Relationships>''',
+        },
+    )
+
+    report = extract_pptx(source, include_visual_evidence=False, include_native_diagrams=False)
+    image = next(item for item in report.to_dict()["objects"] if item["type"] == "image")
+
+    assert report.slides[0].layout_part == "ppt/slideLayouts/slideLayout1.xml"
+    assert image["asset_id"] == "asset-0002"
+    assert report.slides[0].hyperlinks[0]["resolved_target"] is None
+
+
+def test_relationship_types_require_known_ooxml_uris(tmp_path: Path) -> None:
+    source = tmp_path / "foreign-relationship-type.pptx"
+    _package(source)
+    _rewrite_parts(
+        source,
+        {
+            "ppt/slides/_rels/slide1.xml.rels": b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdLayout" Type="urn:attacker/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>',
+        },
+    )
+
+    report = extract_pptx(source, include_visual_evidence=False, include_native_diagrams=False)
+
+    assert report.slides[0].layout_part is None
+
+
+def test_invalid_relationship_target_mode_is_not_resolved(tmp_path: Path) -> None:
+    source = tmp_path / "invalid-target-mode.pptx"
+    _feature_package(source)
+    _rewrite_parts(
+        source,
+        {
+            "ppt/slides/_rels/slide1.xml.rels": b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdImage" Type="/image" Target="../media/image1.png" TargetMode="Bogus"/></Relationships>',
+        },
+    )
+
+    report = extract_pptx(source, include_visual_evidence=False, include_native_diagrams=False)
+    image = next(item for item in report.to_dict()["objects"] if item["type"] == "image")
+
+    assert "asset_id" not in image
+    assert any("invalid TargetMode" in warning for warning in report.warnings)
+
+
+def test_alternate_content_uses_fallback_when_choice_requires_unknown_extension(tmp_path: Path) -> None:
+    source = tmp_path / "alternate-content.pptx"
+    _package(source)
+    _rewrite_parts(
+        source,
+        {
+            "ppt/slides/slide1.xml": b'''<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><p:cSld><p:spTree><mc:AlternateContent><mc:Choice Requires="p14"><p:sp><p:nvSpPr><p:cNvPr id="2" name="Unsupported choice"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr></p:sp></mc:Choice><mc:Fallback><p:sp><p:nvSpPr><p:cNvPr id="3" name="Fallback choice"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr></p:sp></mc:Fallback></mc:AlternateContent></p:spTree></p:cSld></p:sld>''',
+        },
+    )
+
+    objects = extract_pptx(source, include_visual_evidence=False, include_native_diagrams=False).to_dict()["objects"]
+
+    assert [item["name"] for item in objects] == ["Fallback choice"]
+
+
+@pytest.mark.parametrize("part, expected_reason", [("ppt/charts/chart1.xml", "chartSpace"), ("ppt/diagrams/data1.xml", "data part")])
+def test_foreign_semantic_part_roots_are_not_extracted(tmp_path: Path, part: str, expected_reason: str) -> None:
+    source = tmp_path / "foreign-semantic-root.pptx"
+    _feature_package(source)
+    replacement = b'<x:chartSpace xmlns:x="urn:foreign"/>' if "chart" in part else b'<x:data xmlns:x="urn:foreign"/>'
+    _rewrite_parts(source, {part: replacement})
+
+    report = extract_pptx(source, include_visual_evidence=False, include_native_diagrams=False)
+    object_type = "chart" if "chart" in part else "smartart"
+    item = next(item for item in report.to_dict()["objects"] if item["type"] == object_type)
+
+    assert item["semantic_status"] == "unsupported"
+    assert expected_reason in item["unsupported_reason"]
+
+
+def test_custom_image_targets_are_assets(tmp_path: Path) -> None:
+    source = tmp_path / "custom-image-target.pptx"
+    _geometry_package(source)
+    _rewrite_parts(
+        source,
+        {
+            "custom/image.png": b"custom image",
+            "ppt/slides/_rels/slide1.xml.rels": b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdImage" Type="/image" Target="../../custom/image.png"/></Relationships>',
+        },
+    )
+
+    payload = extract_pptx(source, include_visual_evidence=False, include_native_diagrams=False).to_dict()
+    image = next(item for item in payload["objects"] if item["type"] == "image")
+
+    assert image["asset_id"] == "asset-0001"
+    assert payload["assets"][0]["part"] == "custom/image.png"
+
+
+def test_unlisted_slide_parts_are_not_added_to_relationship_defined_slides(tmp_path: Path) -> None:
+    source = tmp_path / "orphan-slide.pptx"
+    _package(source)
+    _rewrite_parts(
+        source,
+        {
+            "ppt/slides/slide2.xml": b'<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree/></p:cSld></p:sld>',
+        },
+    )
+
+    report = extract_pptx(source, include_visual_evidence=False, include_native_diagrams=False)
+
+    assert [slide.part for slide in report.slides] == ["ppt/slides/slide1.xml"]
+    assert any("unlisted conventional slide" in warning.lower() for warning in report.warnings)
+
+
+def test_malformed_native_ids_and_nested_nonfinite_values_do_not_escape(tmp_path: Path) -> None:
+    source = tmp_path / "invalid-native-values.pptx"
+    _package(source)
+    _rewrite_parts(
+        source,
+        {
+            "ppt/slides/slide1.xml": b'''<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="&#178;" name="Invalid ID"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm rot="NaN"><a:off x="0" y="0"/><a:ext cx="10" cy="10"/></a:xfrm></p:spPr></p:sp></p:spTree></p:cSld></p:sld>''',
+        },
+    )
+
+    report = extract_pptx(source, include_visual_evidence=False, include_native_diagrams=False)
+    payload = report.to_dict()
+
+    assert any("invalid native shape ID" in warning for warning in report.warnings)
+    assert "rotation_degrees" not in payload["objects"][0]["style"]
+    report.canonical.objects[0]["style"]["bad"] = math.nan
+    with pytest.raises(ValueError, match="non-finite"):
+        report.to_dict()
+
+
+def test_deckir_rejects_evidence_for_unknown_slide(tmp_path: Path) -> None:
+    source = tmp_path / "unknown-evidence-slide.pptx"
+    _package(source)
+    report = extract_pptx(source, include_visual_evidence=False, include_native_diagrams=False)
+    evidence = {
+        "id": "bad-evidence",
+        "slide_id": "slide-99",
+        "object_id": None,
+        "bbox": [0.0, 0.0, 1.0, 1.0],
+        "value": {},
+        "status": "not_requested",
+        "confidence": None,
+        "evidence_refs": [],
+        "source": {"layer": "rendered_cv"},
+    }
+    report.canonical.rendered_evidence.append(evidence)
+
+    with pytest.raises(ValueError, match="unknown slide"):
+        report.to_dict()
+
+
+def test_malformed_optional_related_parts_become_warnings(tmp_path: Path) -> None:
+    source = tmp_path / "malformed-optional-parts.pptx"
+    _package(source)
+    _rewrite_parts(
+        source,
+        {
+            "ppt/slideLayouts/slideLayout1.xml": b"<broken",
+            "ppt/notesSlides/notesSlide1.xml": b"<broken",
+            "ppt/comments/comment1.xml": b"<broken",
+        },
+    )
+
+    report = extract_pptx(source, include_visual_evidence=False, include_native_diagrams=False)
+
+    assert len(report.slides) == 1
+    assert report.slides[0].notes == []
+    assert report.comments == []
+    assert sum("Invalid XML" in warning for warning in report.warnings) == 3
+
+
 def test_feature_fixture_and_reproducibility(tmp_path: Path) -> None:
     source = tmp_path / "features.pptx"
     _feature_package(source)
@@ -1002,6 +1302,80 @@ def test_selective_vision_filters_noise_and_caches_valid_json(tmp_path: Path) ->
     assert report.canonical.objects[0]["text"] == native_text
 
 
+def test_selective_vision_promotes_confident_diagram_and_cache_result(tmp_path: Path) -> None:
+    source = tmp_path / "vision-confident-diagram.pptx"
+    _feature_package(source)
+
+    class ConfidentVision:
+        name = "confident-vision"
+        version = "1.0"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def analyze(self, prompt: str, images: list[object], timeout: float) -> str:
+            self.calls += 1
+            payload = _vision_payload()
+            payload["image_role"] = "diagram"
+            payload["observations"] = [
+                {
+                    "type": "diagram",
+                    "objects": ["node-a", "node-b"],
+                    "description": "Two connected diagram nodes.",
+                    "confidence": 0.9,
+                }
+            ]
+            payload["nodes"] = [
+                {"id": "node-a", "label": "A", "bbox": [0.1, 0.2, 0.2, 0.2], "status": "verified"},
+                {"id": "node-b", "label": "B", "bbox": [0.6, 0.2, 0.2, 0.2], "status": "verified"},
+            ]
+            payload["edges"] = [
+                {"source": "node-a", "target": "node-b", "label": "", "direction": "left_to_right", "status": "verified"}
+            ]
+            return json.dumps(payload)
+
+    cache = tmp_path / "vision-confident-cache"
+    adapter = ConfidentVision()
+    report = extract_pptx(source)
+    first = run_selective_vision(
+        report,
+        source,
+        asset_ids=["asset-0002"],
+        adapter=adapter,
+        run_ocr_stage=False,
+        include_noise=True,
+        retries=0,
+        retry_backoff=0,
+        cache_dir=cache,
+    )
+
+    assert first[0]["status"] == "verified"
+    assert first[0]["value"]["model_status"] == "ok"
+    assert first[0]["confidence"] == 0.9
+    assert first[0]["value"]["metadata"]["evidence_status"] == "verified"
+    assert report.to_dict()["slides"][0]["visual_evidence_visibility"]["vision"] == "verified"
+    assert json.loads(next(cache.glob("*.json")).read_text(encoding="utf-8"))["evidence_status"] == "verified"
+
+    class FailingVision(ConfidentVision):
+        def analyze(self, prompt: str, images: list[object], timeout: float) -> str:
+            raise AssertionError("cache should prevent a second request")
+
+    second = run_selective_vision(
+        report,
+        source,
+        asset_ids=["asset-0002"],
+        adapter=FailingVision(),
+        run_ocr_stage=False,
+        include_noise=True,
+        retries=0,
+        retry_backoff=0,
+        cache_dir=cache,
+    )
+
+    assert second[0]["status"] == "verified"
+    assert second[0]["source"]["cache_hit"] is True
+
+
 def test_selective_vision_sanitizes_model_statuses_and_audits_usage(tmp_path: Path) -> None:
     source = tmp_path / "vision-sanitized.pptx"
     _feature_package(source)
@@ -1052,7 +1426,7 @@ def test_selective_vision_sanitizes_model_statuses_and_audits_usage(tmp_path: Pa
     assert first[0]["value"]["metadata"]["estimated_cost_usd"] == 0.0000136
     assert first[0]["value"]["metadata"]["attempts"] == 1
     assert first[0]["value"]["metadata"]["sanitization"]["removed_noise_nodes"] == 1
-    assert first[0]["confidence"] <= 0.75
+    assert first[0]["confidence"] is None
 
     second = run_selective_vision(
         report,
@@ -1152,6 +1526,115 @@ def test_selective_vision_retries_invalid_json_within_budget(tmp_path: Path) -> 
     assert adapter.calls == 2
     assert records[0]["value"]["status"] == "partial"
     assert records[0]["value"]["metadata"]["attempts"] == 2
+
+
+def test_optional_stages_do_not_create_records_for_unknown_slide_selections(tmp_path: Path) -> None:
+    source = tmp_path / "unknown-selection.pptx"
+    _feature_package(source)
+
+    class FakeVision:
+        name = "fake-vision"
+        version = "1.0"
+
+        def analyze(self, prompt: str, images: list[object], timeout: float) -> str:
+            return json.dumps(_vision_payload())
+
+    report = extract_pptx(source)
+
+    assert run_selective_vision(report, source, slides=[99], adapter=FakeVision(), run_ocr_stage=False) == []
+    assert report.canonical.vision_evidence == []
+    assert any("unknown slide selection" in warning for warning in report.warnings)
+
+
+def test_optional_stage_cache_failures_and_invalid_cache_payloads_are_non_fatal(tmp_path: Path) -> None:
+    source = tmp_path / "unusable-cache.pptx"
+    _feature_package(source)
+
+    class FakeVision:
+        name = "fake-vision"
+        version = "1.0"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def analyze(self, prompt: str, images: list[object], timeout: float) -> str:
+            self.calls += 1
+            return json.dumps(_vision_payload())
+
+    cache_file = tmp_path / "vision-cache-file"
+    cache_file.write_text("not a directory", encoding="utf-8")
+    adapter = FakeVision()
+    report = extract_pptx(source)
+    first = run_selective_vision(
+        report,
+        source,
+        asset_ids=["asset-0002"],
+        adapter=adapter,
+        run_ocr_stage=False,
+        include_noise=True,
+        cache_dir=cache_file,
+        retry_backoff=0,
+    )
+    assert first[0]["value"]["status"] == "partial"
+    assert any("Vision cache is unavailable" in warning for warning in report.warnings)
+
+    cache_dir = tmp_path / "vision-cache"
+    second_report = extract_pptx(source)
+    second_adapter = FakeVision()
+    run_selective_vision(
+        second_report,
+        source,
+        asset_ids=["asset-0002"],
+        adapter=second_adapter,
+        run_ocr_stage=False,
+        include_noise=True,
+        cache_dir=cache_dir,
+        retry_backoff=0,
+    )
+    cache_path = next(cache_dir.glob("*.json"))
+    cache_path.write_text("[]", encoding="utf-8")
+    rerun = run_selective_vision(
+        second_report,
+        source,
+        asset_ids=["asset-0002"],
+        adapter=second_adapter,
+        run_ocr_stage=False,
+        include_noise=True,
+        cache_dir=cache_dir,
+        retry_backoff=0,
+    )
+    assert rerun[0]["value"]["status"] == "partial"
+    assert second_adapter.calls == 2
+
+
+def test_ocr_rejects_nonfinite_adapter_values_without_invalidating_the_report(tmp_path: Path) -> None:
+    source = tmp_path / "nonfinite-ocr.pptx"
+    _feature_package(source)
+
+    class BadOcr:
+        name = "bad-ocr"
+        version = "1.0"
+
+        def recognize(self, image: bytes, content_type: str) -> OcrResult:
+            return OcrResult(
+                "ok",
+                "bad",
+                [{"text": "bad", "bbox": [math.nan, 0.0, 0.1, 0.1], "confidence": 0.5}],
+                [],
+                100,
+                100,
+                0.5,
+            )
+
+    report = extract_pptx(source)
+    records = run_ocr(report, source, asset_ids=["asset-0002"], adapter=BadOcr(), cache_dir=tmp_path / "ocr-cache", min_dimension=0)
+
+    assert records[0]["status"] == "failed"
+    assert report.to_dict()["ocr_evidence"][0]["status"] == "failed"
+
+
+def test_slide_range_limit_counts_unique_slides() -> None:
+    assert len(parse_slide_range("1-10000,1")) == 10_000
 
 
 def test_evaluation_cli_writes_metrics_outside_canonical_report(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

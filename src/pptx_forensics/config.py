@@ -12,25 +12,16 @@ _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 def load_dotenv(path: str | Path | None = None) -> Path | None:
     """Load a simple project ``.env`` file without overriding real env vars."""
-    candidates: list[Path] = []
     if path is not None:
-        candidates.append(Path(path).expanduser().resolve())
-    candidates.extend(
-        [
-            Path.cwd() / ".env",
-            Path(__file__).resolve().parents[2] / ".env",
-        ]
-    )
-    seen: set[Path] = set()
-    dotenv_path = next(
-        (candidate for candidate in candidates if not (candidate in seen or seen.add(candidate)) and candidate.is_file()),
-        None,
-    )
+        candidates = [Path(path).expanduser().resolve()]
+    else:
+        candidates = [Path.cwd() / ".env", Path(__file__).resolve().parents[2] / ".env"]
+    dotenv_path = next((candidate for candidate in dict.fromkeys(candidates) if candidate.is_file()), None)
     if dotenv_path is None:
         return None
     try:
         lines = dotenv_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except (OSError, UnicodeError):
         return None
     for raw_line in lines:
         line = raw_line.strip()

@@ -1,12 +1,13 @@
-"""Package-aware forensic extraction for PowerPoint Open XML files."""
+"""Package-aware forensic extraction for PowerPoint Open XML and PDF files."""
 
-from .extractor import ExtractionError, extract_pptx
+from .extractor import ExtractionError, extract_document, extract_pptx
+from .pdf import extract_pdf
 from .config import load_dotenv
 from .metrics import compute_metrics
 from .models import DECKIR_SCHEMA, DECKIR_SCHEMA_VERSION, EVIDENCE_STATUSES, IMAGE_ROLES, DeckIR, ExtractionReport
 from .ocr import OcrAdapter, OcrResult, TesseractOcrAdapter, run_ocr
 from .diagrams import add_native_diagram_evidence, classify_raster_failure_classes, reconstruct_diagrams, reconstruct_raster_diagrams
-from .render import parse_slide_range, render_selected_slides
+from .render import parse_slide_range, render_selected_pdf_pages, render_selected_slides
 from .validation import validate_with_openxml_sdk
 from .visual import add_native_visual_evidence, classify_image_role, rendered_geometry_evidence
 from .evaluation import (
@@ -60,6 +61,8 @@ __all__ = [
     "TesseractOcrAdapter",
     "compute_metrics",
     "extract_pptx",
+    "extract_pdf",
+    "extract_document",
     "add_native_visual_evidence",
     "add_native_diagram_evidence",
     "classify_raster_failure_classes",
@@ -67,6 +70,7 @@ __all__ = [
     "parse_slide_range",
     "rendered_geometry_evidence",
     "render_selected_slides",
+    "render_selected_pdf_pages",
     "run_ocr",
     "reconstruct_raster_diagrams",
     "validate_with_openxml_sdk",

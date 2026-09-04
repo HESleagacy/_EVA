@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
-from typing import Any
+import math
+from typing import Any, Mapping
 
 DECKIR_SCHEMA = "deck-ir"
 # Bump this value for every canonical schema change; validation pins v1.
 DECKIR_SCHEMA_VERSION = "1.0"
+NATIVE_SOURCE_LAYERS = frozenset({"native_ooxml", "native_pdf"})
 EVIDENCE_STATUSES = frozenset(
     {
         "verified",
@@ -78,6 +80,51 @@ EVIDENCE_LAYERS = {
     "ocr_evidence": "ocr",
     "vision_evidence": "vision_model",
 }
+CANONICAL_FIELD_TYPES = {
+    "schema_version": str,
+    "deck": dict,
+    "slides": list,
+    "objects": list,
+    "assets": list,
+    "relationships": list,
+    "visual_regions": list,
+    "rendered_evidence": list,
+    "ocr_evidence": list,
+    "vision_evidence": list,
+    "warnings": list,
+    "provenance": dict,
+}
+
+
+def _finite_float(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _validate_bbox(value: Any, context: str) -> None:
+    if not isinstance(value, list) or len(value) != 4:
+        raise ValueError(f"{context} must have a four-value bbox")
+    if any(isinstance(item, bool) for item in value):
+        raise ValueError(f"{context} bbox must contain finite numbers")
+    try:
+        numbers = [float(item) for item in value]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{context} bbox must contain finite numbers") from exc
+    if not all(math.isfinite(item) for item in numbers) or numbers[2] < 0 or numbers[3] < 0:
+        raise ValueError(f"{context} bbox must contain finite numbers with non-negative size")
+
+
+def _validate_finite(value: Any, context: str = "DeckIR") -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{context} contains a non-finite number")
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _validate_finite(item, f"{context}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _validate_finite(item, f"{context}[{index}]")
 
 @dataclass(frozen=True)
 class PartRecord:
@@ -126,9 +173,9 @@ class MediaRecord:
 class DeckIR:
     """The stable interchange contract shared by all extraction adapters.
 
-    Native OOXML data belongs in the primary collections. Derived evidence is
+    Native source data belongs in the primary collections. Derived evidence is
     intentionally kept in separate collections so it cannot replace native
-    facts.
+    facts. ``provenance.native_layer`` identifies the authoritative adapter.
     """
 
     deck: dict[str, Any]
@@ -199,6 +246,7 @@ class DeckIR:
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
+            allow_nan=False,
         )
 
     def validate(self) -> None:
@@ -219,13 +267,47 @@ class DeckIR:
         }
         if tuple(payload) != CANONICAL_KEYS:
             raise ValueError("DeckIR top-level keys do not match the canonical schema")
+        for key in CANONICAL_KEYS:
+            expected = CANONICAL_FIELD_TYPES[key]
+            if not isinstance(payload[key], expected):
+                raise ValueError(f"DeckIR field {key} has an invalid type")
         if self.schema_version != DECKIR_SCHEMA_VERSION:
             raise ValueError(f"Unsupported DeckIR schema version: {self.schema_version}")
         if self.deck.get("schema") != DECKIR_SCHEMA or self.deck.get("schema_version") != DECKIR_SCHEMA_VERSION:
             raise ValueError("DeckIR deck metadata does not match the frozen schema")
         if self.provenance.get("schema") != DECKIR_SCHEMA or self.provenance.get("schema_version") != DECKIR_SCHEMA_VERSION:
             raise ValueError("DeckIR provenance does not match the frozen schema")
+        native_layer = self.provenance.get("native_layer", "native_ooxml")
+        if not isinstance(native_layer, str) or native_layer not in NATIVE_SOURCE_LAYERS:
+            raise ValueError(f"DeckIR has an unsupported native source layer: {native_layer}")
+        slide_size = self.deck.get("slide_size_emu")
+        if slide_size is not None:
+            if not isinstance(slide_size, list) or len(slide_size) != 2:
+                raise ValueError("DeckIR slide_size_emu must contain two values")
+            try:
+                width, height = (float(value) for value in slide_size)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("DeckIR slide_size_emu must contain finite positive numbers") from exc
+            if any(isinstance(value, bool) for value in slide_size) or not all(math.isfinite(value) and value > 0 for value in (width, height)):
+                raise ValueError("DeckIR slide_size_emu must contain finite positive numbers")
+        aspect_ratio = self.deck.get("slide_aspect_ratio")
+        if aspect_ratio is not None:
+            try:
+                valid_aspect_ratio = (
+                    not isinstance(aspect_ratio, bool)
+                    and isinstance(aspect_ratio, (int, float))
+                    and math.isfinite(float(aspect_ratio))
+                    and aspect_ratio > 0
+                )
+            except (TypeError, ValueError, OverflowError):
+                valid_aspect_ratio = False
+            if not valid_aspect_ratio:
+                raise ValueError("DeckIR slide_aspect_ratio must be finite and positive")
+        slide_ids = set()
+        slide_numbers = set()
         for slide in self.slides:
+            if not isinstance(slide, Mapping):
+                raise ValueError("DeckIR slides must be objects")
             missing = [
                 key
                 for key in (
@@ -251,9 +333,19 @@ class DeckIR:
             ]
             if missing:
                 raise ValueError(f"DeckIR slide {slide.get('id', '<unknown>')} is missing {missing}")
-            if slide["slide_reading_order"] not in READING_DIRECTIONS:
+            if not isinstance(slide["id"], str) or not slide["id"]:
+                raise ValueError("DeckIR slides must have non-empty string IDs")
+            if slide["id"] in slide_ids:
+                raise ValueError(f"DeckIR has duplicate slide ID: {slide['id']}")
+            slide_ids.add(slide["id"])
+            if isinstance(slide["number"], bool) or not isinstance(slide["number"], int) or slide["number"] < 1:
+                raise ValueError(f"DeckIR slide {slide['id']} has an invalid number")
+            if slide["number"] in slide_numbers:
+                raise ValueError(f"DeckIR has duplicate slide number: {slide['number']}")
+            slide_numbers.add(slide["number"])
+            if not isinstance(slide["slide_reading_order"], str) or slide["slide_reading_order"] not in READING_DIRECTIONS:
                 raise ValueError(f"DeckIR slide {slide['id']} has an invalid slide_reading_order")
-            if slide["diagram_flow_direction"] not in READING_DIRECTIONS:
+            if not isinstance(slide["diagram_flow_direction"], str) or slide["diagram_flow_direction"] not in READING_DIRECTIONS:
                 raise ValueError(f"DeckIR slide {slide['id']} has an invalid diagram_flow_direction")
             if slide["flow_present"] is not None and not isinstance(slide["flow_present"], bool):
                 raise ValueError(f"DeckIR slide {slide['id']} has an invalid flow_present value")
@@ -265,40 +357,70 @@ class DeckIR:
                 raise ValueError(f"DeckIR slide {slide['id']} cannot claim flow absence without supported evidence")
             visibility = slide["visual_evidence_visibility"]
             if not isinstance(visibility, dict) or set(visibility) != {"native", "rendered", "ocr", "vision"} or any(
-                value not in EVIDENCE_STATUSES for value in visibility.values()
+                not isinstance(value, str) or value not in EVIDENCE_STATUSES for value in visibility.values()
             ):
                 raise ValueError(f"DeckIR slide {slide['id']} has invalid visual_evidence_visibility")
+        object_ids = set()
+        object_slide_ids: dict[str, str] = {}
         for item in self.objects:
+            if not isinstance(item, Mapping):
+                raise ValueError("DeckIR objects must be objects")
             missing = [key for key in OBJECT_KEYS if key not in item]
             if missing:
                 raise ValueError(f"DeckIR object {item.get('id', '<unknown>')} is missing {missing}")
-            bbox = item["bbox"]
-            if not isinstance(bbox, list) or len(bbox) != 4:
-                raise ValueError(f"DeckIR object {item['id']} must have a four-value bbox")
+            if not isinstance(item["id"], str) or not item["id"]:
+                raise ValueError("DeckIR objects must have non-empty string IDs")
+            if item["id"] in object_ids:
+                raise ValueError(f"DeckIR has duplicate object ID: {item['id']}")
+            object_ids.add(item["id"])
+            object_slide_ids[item["id"]] = item["slide_id"]
+            if not isinstance(item.get("slide_id"), str) or item["slide_id"] not in slide_ids:
+                raise ValueError(f"DeckIR object {item['id']} references an unknown slide")
+            _validate_bbox(item["bbox"], f"DeckIR object {item['id']}")
             source = item["source"]
-            if source.get("layer") != "native_ooxml":
+            if not isinstance(source, Mapping) or source.get("layer") != native_layer:
                 raise ValueError(f"Native object {item['id']} has a non-native source layer")
+        evidence_slide_ids = slide_ids
         for collection, layer in EVIDENCE_LAYERS.items():
             for item in getattr(self, collection):
+                if not isinstance(item, Mapping):
+                    raise ValueError(f"{collection} evidence records must be objects")
+                if not isinstance(item.get("id"), str) or not item["id"]:
+                    raise ValueError(f"{collection} evidence must have a non-empty ID")
+                slide_id = item.get("slide_id")
+                if not isinstance(slide_id, str) or slide_id not in evidence_slide_ids:
+                    raise ValueError(f"{collection} evidence references an unknown slide")
+                object_id = item.get("object_id")
+                if object_id is not None and (not isinstance(object_id, str) or object_id not in object_ids):
+                    raise ValueError(f"{collection} evidence references an unknown object")
+                if object_id is not None and object_slide_ids[object_id] != slide_id:
+                    raise ValueError(f"{collection} evidence references an object on another slide")
                 self._validate_evidence_record(collection, item, layer)
+        _validate_finite(payload)
 
     @staticmethod
     def _validate_evidence_record(collection: str, item: dict[str, Any], layer: str) -> None:
+        if not isinstance(item, Mapping):
+            raise ValueError(f"{collection} evidence records must be objects")
         required = {"id", "slide_id", "object_id", "bbox", "value", "status", "confidence", "source", "evidence_refs"}
         missing = required.difference(item)
         if missing:
             raise ValueError(f"{collection} evidence is missing {sorted(missing)}")
-        if item["status"] not in EVIDENCE_STATUSES:
+        if not isinstance(item["status"], str) or item["status"] not in EVIDENCE_STATUSES:
             raise ValueError(f"{collection} evidence has an invalid status: {item['status']}")
         source = item.get("source")
         if not isinstance(source, dict) or source.get("layer") != layer:
             raise ValueError(f"{collection} evidence must use source layer {layer}")
         confidence = item["confidence"]
-        if confidence is not None and (isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1):
+        if confidence is not None and (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not _finite_float(confidence)
+            or not 0 <= confidence <= 1
+        ):
             raise ValueError(f"{collection} evidence confidence must be between 0 and 1")
         bbox = item["bbox"]
-        if not isinstance(bbox, list) or len(bbox) != 4:
-            raise ValueError(f"{collection} evidence bbox must contain four values")
+        _validate_bbox(bbox, f"{collection} evidence")
         refs = item["evidence_refs"]
         if not isinstance(refs, list) or not all(isinstance(ref, dict) and isinstance(ref.get("id"), str) and ref["id"] for ref in refs):
             raise ValueError(f"{collection} evidence references must be non-empty identified records")
@@ -316,14 +438,18 @@ class DeckIR:
             raise ValueError(f"Evidence is missing {sorted(missing)}")
         if not isinstance(evidence["source"], dict) or evidence["source"].get("layer") != EVIDENCE_LAYERS[collection]:
             raise ValueError(f"Evidence source layer must be {EVIDENCE_LAYERS[collection]}")
-        if evidence["status"] not in EVIDENCE_STATUSES:
+        if not isinstance(evidence["status"], str) or evidence["status"] not in EVIDENCE_STATUSES:
             raise ValueError(f"Evidence status must be one of {sorted(EVIDENCE_STATUSES)}")
         confidence = evidence["confidence"]
-        if confidence is not None and (isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1):
+        if confidence is not None and (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not _finite_float(confidence)
+            or not 0 <= confidence <= 1
+        ):
             raise ValueError("Evidence confidence must be between 0 and 1")
         bbox = evidence["bbox"]
-        if not isinstance(bbox, list) or len(bbox) != 4:
-            raise ValueError("Evidence bbox must contain four values")
+        _validate_bbox(bbox, "Evidence")
         refs = evidence["evidence_refs"]
         if not isinstance(refs, list) or not all(isinstance(ref, dict) and isinstance(ref.get("id"), str) and ref["id"] for ref in refs):
             raise ValueError("Evidence references must be a list of identified records")
@@ -347,6 +473,9 @@ class ExtractionReport:
     evidence_dir: str | None = None
     warnings: list[str] = field(default_factory=list)
     canonical: DeckIR | None = None
+    # PDF assets are kept in memory so optional evidence stages do not need to
+    # reopen the source with a format-specific container assumption.
+    asset_bytes_by_id: dict[str, bytes] = field(default_factory=dict, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the full DeckIR contract used by pipeline diagnostics."""
@@ -365,13 +494,23 @@ class ExtractionReport:
     def to_debug_dict(self) -> dict[str, Any]:
         """Return the internal/full report for pipeline diagnostics and evaluation."""
         if self.canonical is not None:
-            return self.canonical.to_dict()
+            payload = self.canonical.to_dict()
+            payload["comments"] = self.comments
+            payload["convenience"] = self.convenience
+            if self.evidence_dir is not None:
+                payload["evidence_dir"] = self.evidence_dir
+            return payload
         return self.to_legacy_dict()
 
     def to_legacy_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload.pop("canonical", None)
+        payload.pop("asset_bytes_by_id", None)
         return payload
+
+    def asset_bytes(self, asset_id: str) -> bytes | None:
+        """Return retained native asset bytes for optional evidence stages."""
+        return self.asset_bytes_by_id.get(asset_id)
 
     def to_json(self) -> str:
         from .output import render_semantic_json

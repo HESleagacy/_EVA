@@ -2,17 +2,58 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Iterable
 
 from .models import RelationshipRecord
+
+
+RELATIONSHIP_NAMESPACES = frozenset(
+    {
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "http://purl.oclc.org/ooxml/officeDocument/relationships",
+    }
+)
+STRICT_RELATIONSHIP_TYPE_NS = "http://purl.oclc.org/ooxml"
+CHART_NAMESPACES = frozenset(
+    {
+        "http://schemas.openxmlformats.org/drawingml/2006/chart",
+        "http://purl.oclc.org/ooxml/drawingml/chart",
+    }
+)
+DIAGRAM_NAMESPACES = frozenset(
+    {
+        "http://schemas.openxmlformats.org/drawingml/2006/diagram",
+        "http://purl.oclc.org/ooxml/drawingml/diagram",
+    }
+)
 
 
 def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+def _namespace(tag: str) -> str:
+    return tag[1 : tag.index("}")] if tag.startswith("{") and "}" in tag else ""
+
+
+def _known_tag(tag: str) -> bool:
+    namespace = _namespace(tag)
+    return not namespace or namespace in {
+        *RELATIONSHIP_NAMESPACES,
+        "http://schemas.openxmlformats.org/presentationml/2006/main",
+        "http://purl.oclc.org/ooxml/presentationml/main",
+        "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "http://purl.oclc.org/ooxml/drawingml/main",
+        "http://schemas.openxmlformats.org/drawingml/2006/chart",
+        "http://purl.oclc.org/ooxml/drawingml/chart",
+        "http://schemas.openxmlformats.org/drawingml/2006/diagram",
+        "http://purl.oclc.org/ooxml/drawingml/diagram",
+    }
+
+
 def _children(root: Any, name: str) -> list[Any]:
-    return [item for item in list(root) if _local_name(item.tag) == name]
+    return [item for item in list(root) if _local_name(item.tag) == name and _known_tag(item.tag)]
 
 
 def _child(root: Any, name: str) -> Any | None:
@@ -20,7 +61,7 @@ def _child(root: Any, name: str) -> Any | None:
 
 
 def _descendants(root: Any, name: str) -> list[Any]:
-    return [item for item in root.iter() if _local_name(item.tag) == name]
+    return [item for item in root.iter() if _local_name(item.tag) == name and _known_tag(item.tag)]
 
 
 def _first(root: Any, name: str) -> Any | None:
@@ -28,29 +69,53 @@ def _first(root: Any, name: str) -> Any | None:
 
 
 def _text(root: Any) -> str:
+    paragraphs: list[str] = []
+    for paragraph in (item for item in root.iter() if _local_name(item.tag) == "p" and _known_tag(item.tag)):
+        pieces: list[str] = []
+        for descendant in paragraph.iter():
+            if not _known_tag(descendant.tag):
+                continue
+            kind = _local_name(descendant.tag)
+            if kind == "t" and descendant.text is not None:
+                pieces.append(descendant.text)
+            elif kind == "br":
+                pieces.append("\n")
+            elif kind == "tab":
+                pieces.append("\t")
+        paragraphs.append("".join(pieces))
+    if paragraphs:
+        return "\n".join(paragraphs)
     return " ".join(item.text.strip() for item in _descendants(root, "t") if item.text and item.text.strip())
 
 
 def _chart_text(root: Any | None) -> str:
     if root is None:
         return ""
-    values = [item.text.strip() for item in root.iter() if _local_name(item.tag) in {"t", "v"} and item.text and item.text.strip()]
+    values = [
+        item.text.strip()
+        for item in root.iter()
+        if _local_name(item.tag) in {"t", "v"}
+        and _known_tag(item.tag)
+        and item.text
+        and item.text.strip()
+    ]
     return " ".join(values)
 
 
 def _bool(value: str | None) -> bool | None:
     if value is None:
         return None
-    return value in {"1", "true", "on"}
+    return value.casefold() in {"1", "true", "on"}
 
 
 def _number(value: str | None, divisor: float = 1.0) -> float | None:
     if value is None:
         return None
     try:
-        return float(value) / divisor
-    except ValueError:
+        result = float(value) / divisor
+    except (TypeError, ValueError):
         return None
+    return result if math.isfinite(result) else None
 
 
 def _theme_colors(theme: Any | None) -> dict[str, str]:
@@ -61,7 +126,16 @@ def _theme_colors(theme: Any | None) -> dict[str, str]:
         return {}
     colors: dict[str, str] = {}
     for item in list(scheme):
-        color = next((child for child in list(item) if _local_name(child.tag) in {"srgbClr", "sysClr", "scrgbClr"}), None)
+        if not _known_tag(item.tag):
+            continue
+        color = next(
+            (
+                child
+                for child in list(item)
+                if _local_name(child.tag) in {"srgbClr", "sysClr", "scrgbClr"} and _known_tag(child.tag)
+            ),
+            None,
+        )
         if color is not None:
             colors[_local_name(item.tag)] = color.get("lastClr") or color.get("val", "")
     colors.update({"tx1": colors.get("dk1", ""), "tx2": colors.get("dk2", ""), "bg1": colors.get("lt1", ""), "bg2": colors.get("lt2", "")})
@@ -86,7 +160,15 @@ def _theme_fonts(theme: Any | None) -> dict[str, str]:
 def _color(fill: Any | None, theme_colors: dict[str, str], raw: bool = False) -> dict[str, Any] | None:
     if fill is None:
         return None
-    color = next((item for item in fill.iter() if _local_name(item.tag) in {"srgbClr", "schemeClr", "sysClr", "prstClr", "scrgbClr"}), None)
+    color = next(
+        (
+            item
+            for item in fill.iter()
+            if _local_name(item.tag) in {"srgbClr", "schemeClr", "sysClr", "prstClr", "scrgbClr"}
+            and _known_tag(item.tag)
+        ),
+        None,
+    )
     if color is None:
         return {"kind": _local_name(fill.tag)}
     kind = _local_name(color.tag)
@@ -94,9 +176,27 @@ def _color(fill: Any | None, theme_colors: dict[str, str], raw: bool = False) ->
     resolved = value
     if kind == "schemeClr":
         resolved = theme_colors.get(value, value)
+    elif kind == "sysClr":
+        resolved = color.get("lastClr") or value
+    elif kind == "scrgbClr" and not value:
+        components: list[int] = []
+        for attribute in ("r", "g", "b"):
+            try:
+                component = float(color.get(attribute, ""))
+            except (TypeError, ValueError):
+                components = []
+                break
+            if not math.isfinite(component) or not 0 <= component <= 100000:
+                components = []
+                break
+            components.append(round(component * 255 / 100000))
+        if len(components) == 3:
+            resolved = "".join(f"{component:02x}" for component in components)
     alpha = _first(color, "alpha")
     alpha_value = _number(alpha.get("val") if alpha is not None else None, 100_000)
     result: dict[str, Any] = {"kind": "solid", "color": value if raw else resolved, "source": kind}
+    if kind == "scrgbClr" and not value:
+        result["components"] = {attribute: color.get(attribute) for attribute in ("r", "g", "b") if color.get(attribute) is not None}
     if alpha_value is not None:
         result["opacity"] = round(alpha_value, 6)
         result["transparency"] = round(1.0 - alpha_value, 6)
@@ -127,7 +227,14 @@ def _line(sp_properties: Any | None, theme_colors: dict[str, str], raw: bool = F
     result: dict[str, Any] = {}
     if line.get("w"):
         result["width_emu"] = line.get("w") if raw else _number(line.get("w"))
-    fill = next((item for item in list(line) if _local_name(item.tag) in {"noFill", "solidFill", "gradFill", "pattFill"}), None)
+    fill = next(
+        (
+            item
+            for item in list(line)
+            if _local_name(item.tag) in {"noFill", "solidFill", "gradFill", "pattFill"} and _known_tag(item.tag)
+        ),
+        None,
+    )
     result["fill"] = _color(fill, theme_colors, raw) if fill is not None else None
     if line.get("cap"):
         result["cap"] = line.get("cap")
@@ -148,12 +255,19 @@ def _rpr_style(rpr: Any | None, theme_colors: dict[str, str], raw: bool = False)
             style[key] = rpr.get(attribute) if raw else value
     fonts: dict[str, str] = {}
     for child in list(rpr):
-        if _local_name(child.tag) in {"latin", "ea", "cs"} and child.get("typeface"):
+        if _local_name(child.tag) in {"latin", "ea", "cs"} and _known_tag(child.tag) and child.get("typeface"):
             fonts[_local_name(child.tag)] = child.get("typeface")
     if fonts:
         style["fonts"] = fonts
         style["font_family"] = fonts.get("latin") or fonts.get("ea") or fonts.get("cs")
-    color = next((item for item in list(rpr) if _local_name(item.tag) in {"solidFill", "gradFill"}), None)
+    color = next(
+        (
+            item
+            for item in list(rpr)
+            if _local_name(item.tag) in {"solidFill", "gradFill"} and _known_tag(item.tag)
+        ),
+        None,
+    )
     if color is not None:
         style["font_color"] = _color(color, theme_colors, raw)
     return style
@@ -203,7 +317,7 @@ def _placeholder_match(root: Any | None, placeholder: Any | None) -> Any | None:
     wanted_type = placeholder.get("type", "body")
     wanted_idx = placeholder.get("idx")
     for element in root.iter():
-        if _local_name(element.tag) not in {"sp", "pic", "graphicFrame"}:
+        if _local_name(element.tag) not in {"sp", "pic", "graphicFrame"} or not _known_tag(element.tag):
             continue
         candidate = _placeholder(element)
         if candidate is None or candidate.get("type", "body") != wanted_type:
@@ -305,15 +419,45 @@ def resolve_style(element: Any, layout: Any | None, master: Any | None, theme: A
 
 
 def _relationship(element: Any, relations: Iterable[RelationshipRecord], suffix: str | None = None) -> RelationshipRecord | None:
-    relation_map = {item.relationship_id: item for item in relations}
+    relation_map: dict[str, RelationshipRecord] = {}
+    for item in relations:
+        relation_map.setdefault(item.relationship_id, item)
     for descendant in element.iter():
         for key, value in descendant.attrib.items():
-            if not key.partition("}")[0].endswith("relationships"):
+            if _namespace(key) not in RELATIONSHIP_NAMESPACES:
                 continue
             relation = relation_map.get(value)
-            if relation is not None and (suffix is None or relation.relationship_type.endswith(suffix)):
+            if relation is not None and (suffix is None or _relationship_type_name(relation.relationship_type) == _relationship_type_name(suffix)):
                 return relation
     return None
+
+
+def _relationship_type_name(value: str | None) -> str:
+    raw = (value or "").strip().rstrip("/")
+    if raw.startswith("/"):
+        raw = raw[1:]
+    known = {
+        "chart",
+        "diagram",
+        "diagramData",
+        "hyperlink",
+        "image",
+        "notesSlide",
+        "officeDocument",
+        "oleObject",
+        "slide",
+        "slideLayout",
+        "slideMaster",
+        "theme",
+    }
+    if raw in known:
+        return raw.casefold()
+    for namespace in (*RELATIONSHIP_NAMESPACES, STRICT_RELATIONSHIP_TYPE_NS):
+        prefix = f"{namespace}/"
+        original = (value or "").strip().rstrip("/")
+        if original.startswith(prefix) and original[len(prefix) :] in known:
+            return original[len(prefix) :].casefold()
+    return ""
 
 
 def _cache_values(root: Any | None) -> list[dict[str, Any]]:
@@ -333,27 +477,50 @@ def _chart_semantics(element: Any, relations: Iterable[RelationshipRecord], part
         return {"semantic_status": "unsupported", "unsupported_reason": "chart part relationship is missing"}
     from defusedxml import ElementTree as SafeET
 
-    root = SafeET.fromstring(parts[relation.resolved_target])
-    chart_types = [item for item in root.iter() if _local_name(item.tag).endswith("Chart") and _local_name(item.tag) not in {"chart", "chartSpace"}]
+    try:
+        root = SafeET.fromstring(parts[relation.resolved_target])
+    except Exception as exc:
+        return {
+            "semantic_status": "failed",
+            "unsupported_reason": "chart XML is invalid",
+            "error": str(exc),
+        }
+    if _local_name(root.tag) != "chartSpace" or (_namespace(root.tag) and _namespace(root.tag) not in CHART_NAMESPACES):
+        return {
+            "semantic_status": "unsupported",
+            "unsupported_reason": "chart XML root is not a recognized chartSpace",
+        }
+    chart_types = [
+        item
+        for item in root.iter()
+        if _known_tag(item.tag)
+        and _local_name(item.tag).endswith("Chart")
+        and _local_name(item.tag) not in {"chart", "chartSpace"}
+    ]
     chart_type = _local_name(chart_types[0].tag)[:-5] if chart_types else "unknown"
+    chart = _child(root, "chart")
     series = []
     for series_element in _descendants(root, "ser"):
         title = _chart_text(_first(series_element, "tx"))
         category = _first(series_element, "cat")
+        if category is None:
+            category = _first(series_element, "xVal")
         values = _first(series_element, "val")
+        if values is None:
+            values = _first(series_element, "yVal")
         series.append({"title": title, "categories": _cache_values(category), "values": _cache_values(values)})
     axes = []
     for axis in root.iter():
-        if _local_name(axis.tag) in {"catAx", "dateAx", "valAx", "serAx"}:
+        if _known_tag(axis.tag) and _local_name(axis.tag) in {"catAx", "dateAx", "valAx", "serAx"}:
             axis_id = _first(axis, "axId")
             axes.append({"type": _local_name(axis.tag), "id": axis_id.get("val") if axis_id is not None else None, "title": _chart_text(_first(axis, "title"))})
-    legend = _first(root, "legend")
+    legend = _child(chart, "legend") if chart is not None else _first(root, "legend")
     return {
         "semantic_status": "extracted",
         "chart_data": {
             "part": relation.resolved_target,
             "type": chart_type,
-            "title": _chart_text(_first(root, "title")),
+            "title": _chart_text(_child(chart, "title") if chart is not None else None),
             "legend": _chart_text(legend),
             "axes": axes,
             "series": series,
@@ -367,7 +534,19 @@ def _smartart_semantics(element: Any, relations: Iterable[RelationshipRecord], p
         return {"semantic_status": "unsupported", "unsupported_reason": "SmartArt data relationship is missing"}
     from defusedxml import ElementTree as SafeET
 
-    root = SafeET.fromstring(parts[relation.resolved_target])
+    try:
+        root = SafeET.fromstring(parts[relation.resolved_target])
+    except Exception as exc:
+        return {
+            "semantic_status": "failed",
+            "unsupported_reason": "SmartArt XML is invalid",
+            "error": str(exc),
+        }
+    if _local_name(root.tag) != "data" or (_namespace(root.tag) and _namespace(root.tag) not in DIAGRAM_NAMESPACES):
+        return {
+            "semantic_status": "unsupported",
+            "unsupported_reason": "SmartArt XML root is not a recognized data part",
+        }
     nodes = []
     point_list = _first(root, "ptLst")
     if point_list is not None:
@@ -386,9 +565,48 @@ def _table_semantics(element: Any) -> dict[str, Any]:
     if table is None:
         return {"semantic_status": "unsupported", "unsupported_reason": "table XML is missing"}
     rows = []
-    for row in _children(table, "tr"):
-        rows.append([_text(cell) for cell in _children(row, "tc")])
-    return {"semantic_status": "extracted", "table_data": {"rows": rows, "row_count": len(rows), "column_count": max((len(row) for row in rows), default=0)}}
+    cell_spans = []
+    grid = _child(table, "tblGrid")
+    grid_column_count = len(_children(grid, "gridCol")) if grid is not None else 0
+    for row_index, row in enumerate(_children(table, "tr")):
+        row_values = []
+        column_index = 0
+        for cell in _children(row, "tc"):
+            row_values.append(_text(cell))
+            try:
+                grid_span = max(1, int(cell.get("gridSpan", "1")))
+            except (TypeError, ValueError):
+                grid_span = 1
+            try:
+                row_span = max(1, int(cell.get("rowSpan", "1")))
+            except (TypeError, ValueError):
+                row_span = 1
+            merged = grid_span != 1 or row_span != 1 or cell.get("hMerge") is not None or cell.get("vMerge") is not None
+            if merged:
+                cell_spans.append(
+                    {
+                        "row": row_index,
+                        "column": column_index,
+                        "grid_span": grid_span,
+                        "row_span": row_span,
+                        "horizontal_merge": cell.get("hMerge"),
+                        "vertical_merge": cell.get("vMerge"),
+                    }
+                )
+            column_index += grid_span
+        grid_column_count = max(grid_column_count, column_index)
+        rows.append(row_values)
+    table_data: dict[str, Any] = {
+        "rows": rows,
+        "row_count": len(rows),
+        "column_count": grid_column_count or max((len(row) for row in rows), default=0),
+    }
+    if grid_column_count or cell_spans:
+        if grid_column_count:
+            table_data["grid_column_count"] = grid_column_count
+        if cell_spans:
+            table_data["cell_spans"] = cell_spans
+    return {"semantic_status": "extracted", "table_data": table_data}
 
 
 def native_semantics(
@@ -407,8 +625,13 @@ def native_semantics(
     ole = _relationship(element, relations, "/oleObject")
     if ole is not None:
         preview = None
+        relationship_ids = set()
+        for descendant in element.iter():
+            for key, value in descendant.attrib.items():
+                if _namespace(key) in RELATIONSHIP_NAMESPACES:
+                    relationship_ids.add(value)
         for relation in relations:
-            if relation.relationship_id in {value for descendant in element.iter() for key, value in descendant.attrib.items() if key.partition("}")[0].endswith("relationships")} and relation.resolved_target in asset_ids and relation.resolved_target.startswith("ppt/media/"):
+            if relation.relationship_id in relationship_ids and relation.resolved_target in asset_ids and relation.resolved_target != ole.resolved_target:
                 preview = asset_ids[relation.resolved_target]
                 break
         ole_element = _first(element, "oleObj")

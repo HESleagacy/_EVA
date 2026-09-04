@@ -1139,14 +1139,25 @@ def reconstruct_raster_diagrams(
         if asset_id:
             ocr_by_asset[asset_id] = item
     results: list[dict[str, Any]] = []
-    with zipfile.ZipFile(Path(source).expanduser().resolve()) as archive:
+    convenience = report.convenience if isinstance(report.convenience, dict) else {}
+    archive = None
+    if convenience.get("adapter") != "pdf":
+        try:
+            archive = zipfile.ZipFile(Path(source).expanduser().resolve())
+        except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+            report.warnings.append(f"Raster diagram stage could not open source package: {exc}")
+            return results
+    try:
         for (slide_id, asset_id), instance in sorted(first_instance.items()):
             asset = assets.get(asset_id)
             if asset is None:
                 continue
             try:
-                image_data = archive.read(asset["part"])
-            except (KeyError, OSError, RuntimeError):
+                if archive is not None:
+                    image_data = archive.read(asset["part"])
+                else:
+                    image_data = report.asset_bytes_by_id.get(asset_id)
+            except (KeyError, OSError, RuntimeError, zipfile.BadZipFile, NotImplementedError, EOFError, ValueError):
                 image_data = None
             raster_records = _raster_graph(report.canonical, slide_id, asset, image_data, ocr_by_asset.get(asset_id))
             results.extend(raster_records)
@@ -1158,6 +1169,9 @@ def reconstruct_raster_diagrams(
                     slide_record["flow_presence_basis"] = graph.get("flow_presence_basis", "raster_edge_candidate")
                     if graph.get("diagram_flow_direction") != "unknown":
                         slide_record["diagram_flow_direction"] = graph["diagram_flow_direction"]
+    finally:
+        if archive is not None:
+            archive.close()
     return results
 
 
