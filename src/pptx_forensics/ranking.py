@@ -11,6 +11,7 @@ import tempfile
 from typing import Any
 
 from .deck_evaluation import (
+    MISSING_EVIDENCE_PENALTY,
     ProblemStatement,
     ProblemStatementError,
     evaluate_deck,
@@ -41,6 +42,13 @@ _FILENAME_PS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _TEAM_PATTERN = re.compile(r"team\s+name\s*[:#\-–—]?\s*([^\r\n]+)", re.IGNORECASE)
+_REVIEW_AREA_LABELS = {
+    "fit_to_problem": "Fit to the stated problem",
+    "technical_approach": "Technical approach",
+    "validation_presented": "Validation presented",
+    "differentiation": "Differentiation",
+    "presentation": "Presentation",
+}
 
 
 @dataclass(frozen=True)
@@ -205,8 +213,15 @@ def render_evaluation_markdown(result: SubmissionResult) -> str:
     findings = result.evaluation.get("findings", {}) if result.evaluation else {}
     if not isinstance(findings, Mapping):
         findings = {}
-    lines.extend(_finding_section("Strengths", findings.get("strengths", [])))
-    lines.extend(_finding_section("Improvement Signals", [*findings.get("weaknesses", []), *findings.get("ambiguous_points", [])]))
+    review = result.evaluation.get("review") if result.evaluation else None
+    if not isinstance(review, Mapping) and result.evaluation:
+        semantic = result.evaluation.get("semantic")
+        review = semantic.get("review") if isinstance(semantic, Mapping) else None
+    if isinstance(review, Mapping):
+        lines.extend(_review_sections(review))
+    else:
+        lines.extend(_finding_section("Strengths", findings.get("strengths", [])))
+        lines.extend(_finding_section("Improvement Signals", [*findings.get("weaknesses", []), *findings.get("ambiguous_points", [])]))
     lines.extend(["## Evidence Coverage", ""])
     for label, value in (result.evidence or {}).items():
         lines.append(f"- {label}: `{value}`")
@@ -285,6 +300,7 @@ def rank_submissions(
     vision_include_noise: bool = False,
     semantic_timeout: float = 30.0,
     fresh_semantic: bool = False,
+    missing_evidence_penalty: float = MISSING_EVIDENCE_PENALTY,
     thresholds: BucketThresholds = BucketThresholds(),
 ) -> list[SubmissionResult]:
     """Evaluate, rank, bucket, and write Markdown-only submission outputs."""
@@ -328,6 +344,7 @@ def rank_submissions(
             vision_include_noise=vision_include_noise,
             semantic_timeout=semantic_timeout,
             fresh_semantic=fresh_semantic,
+            missing_evidence_penalty=missing_evidence_penalty,
         )
         results.append(result)
 
@@ -370,6 +387,7 @@ def _process_submission(
     vision_include_noise: bool,
     semantic_timeout: float,
     fresh_semantic: bool,
+    missing_evidence_penalty: float,
 ) -> SubmissionResult:
     fallback_id = f"{safe_slug(source.stem)}-{hashlib.sha256(str(source).encode()).hexdigest()[:8]}"
     team = source.stem
@@ -446,11 +464,13 @@ def _process_submission(
                 semantic_timeout=semantic_timeout,
                 skip_semantic=skip_semantic,
                 fresh_semantic=fresh_semantic,
+                missing_evidence_penalty=missing_evidence_penalty,
             )
             final_score = _score(evaluation, ("final_score",))
             proposal_score = _score(evaluation, ("scores", "proposal_strength", "score"))
             deck_quality_score = _score(evaluation, ("scores", "deck_quality", "score"))
             evidence = _evidence_summary(report, evaluation)
+            evidence["Missing-evidence policy"] = f"{missing_evidence_penalty:g} points per distinct item"
             digest = report.source_sha256[:8]
             submission_id = f"{safe_slug(team)}-{safe_slug(source.stem)}-{digest}"
             return SubmissionResult(
@@ -602,9 +622,76 @@ def _finding_section(title: str, findings: Any) -> list[str]:
     return lines
 
 
+def _review_sections(review: Mapping[str, Any]) -> list[str]:
+    areas = review.get("area_reviews", [])
+    ratings = [float(item["rating"]) for item in areas if isinstance(item, Mapping) and _finite_number(item.get("rating"))]
+    overall = sum(ratings) / len(ratings) if ratings else None
+    lines = ["## Reviewer Assessment", ""]
+    if overall is not None:
+        lines.append(f"- Overall reviewer rating: `{overall:.1f}/10`")
+    lines.append(f"- Decision: `{_one_line(review.get('decision', 'needs_revision'))}`")
+    lines.extend(["", "## Area Review", "", "| Area | Rating | Reason |", "| --- | ---: | --- |"])
+    for item in areas:
+        if not isinstance(item, Mapping):
+            continue
+        area = _REVIEW_AREA_LABELS.get(str(item.get("area")), str(item.get("area", "Area")))
+        rating = item.get("rating", "N/A")
+        reason = _one_line(item.get("reason", ""))
+        missing = item.get("missing_evidence")
+        if isinstance(missing, list) and missing:
+            reason += f" Missing: {_one_line('; '.join(str(value) for value in missing))}."
+        lines.append(f"| {_table_text(area)} | {rating}/10 | {reason} |")
+    lines.append("")
+    lines.extend(_review_point_section("What Earns the Score", review.get("strengths", []), "point"))
+    lines.extend(_review_point_section("What Prevents a Higher Score", review.get("risks", []), "risk"))
+    lines.extend(["## Judging Decision", ""])
+    next_evidence = review.get("next_evidence", [])
+    if isinstance(next_evidence, list) and next_evidence:
+        for item in next_evidence:
+            lines.append(f"- {_one_line(item)}")
+    else:
+        lines.append("- No additional evidence request was produced.")
+    lines.append("")
+    limitations = review.get("limitations", [])
+    if isinstance(limitations, list) and limitations:
+        lines.extend(["## Evaluation Limits", ""])
+        for item in limitations:
+            lines.append(f"- {_one_line(item)}")
+        lines.append("")
+    return lines
+
+
+def _review_point_section(title: str, items: Any, kind: str) -> list[str]:
+    lines = [f"## {title}", ""]
+    if not isinstance(items, list) or not items:
+        lines.append("- None reported.")
+        lines.append("")
+        return lines
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        if kind == "point":
+            text = _one_line(item.get("point", ""))
+        else:
+            text = f"**{_one_line(item.get('title', 'Risk'))}**: {_one_line(item.get('detail', ''))}"
+        evidence = item.get("evidence_slides")
+        suffix = f"; slides: {', '.join(str(value) for value in evidence)}" if isinstance(evidence, list) and evidence else ""
+        lines.append(f"- {text}{suffix}")
+    lines.append("")
+    return lines
+
+
 def _one_line(value: Any) -> str:
     return " ".join(str(value or "").split()).replace("|", "\\|")
 
 
 def _table_text(value: Any) -> str:
     return _one_line(value)
+
+
+def _finite_number(value: Any) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return number == number and abs(number) != float("inf")

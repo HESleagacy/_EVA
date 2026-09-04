@@ -77,6 +77,49 @@ def test_final_reports_are_narrative_only() -> None:
     assert "Native objects" in report
 
 
+def test_final_reports_render_reviewer_critique_when_available() -> None:
+    result = SubmissionResult(
+        Path("submission.pdf"),
+        "team-submission",
+        "Team",
+        "26168",
+        "Custom navigation PS",
+        "scored",
+        evaluation={
+            "review": {
+                "area_reviews": [
+                    {
+                        "area": area,
+                        "rating": 8,
+                        "reason": "Evidence is present.",
+                        "evidence_slides": [1],
+                        "missing_evidence": [],
+                    }
+                    for area in (
+                        "fit_to_problem",
+                        "technical_approach",
+                        "validation_presented",
+                        "differentiation",
+                        "presentation",
+                    )
+                ],
+                "strengths": [{"point": "Coherent approach.", "evidence_slides": [1]}],
+                "risks": [{"title": "Validation gap", "detail": "More trials needed.", "evidence_slides": [1]}],
+                "next_evidence": ["Show an unseen-device trial."],
+                "decision": "needs_revision",
+                "limitations": ["External links were not inspected."],
+            }
+        },
+    )
+
+    report = render_evaluation_markdown(result)
+
+    assert "## Area Review" in report
+    assert "## What Prevents a Higher Score" in report
+    assert "## Judging Decision" in report
+    assert "External links were not inspected." in report
+
+
 def test_ranking_report_groups_problem_statements() -> None:
     result = SubmissionResult(Path("a.pdf"), "team-a", "A", "26168", "Custom PS", "review")
 

@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 
 from .deck_evaluation import (
+    MISSING_EVIDENCE_PENALTY,
     ProblemStatementError,
     evaluate_deck_file,
 )
@@ -27,6 +28,12 @@ def main(argv: list[str] | None = None) -> int:
         help="bypass the semantic cache and request a fresh model score",
     )
     parser.add_argument("--semantic-timeout", type=float, default=30.0, help="Gemini timeout in seconds")
+    parser.add_argument(
+        "--missing-evidence-penalty",
+        type=float,
+        default=MISSING_EVIDENCE_PENALTY,
+        help="points deducted per distinct missing-evidence item",
+    )
     parser.add_argument("--output", type=Path, help="write evaluation JSON to this path instead of stdout")
     args = parser.parse_args(argv)
     if args.problem is None and not args.deck_only:
@@ -41,6 +48,7 @@ def main(argv: list[str] | None = None) -> int:
             semantic_timeout=args.semantic_timeout,
             skip_semantic=args.skip_semantic,
             fresh_semantic=args.fresh_semantic,
+            missing_evidence_penalty=args.missing_evidence_penalty,
         )
     except (OSError, ProblemStatementError, ValueError) as exc:
         parser.error(str(exc))

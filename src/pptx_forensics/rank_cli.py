@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from .deck_evaluation import ProblemStatementError, load_problem_statement
+from .deck_evaluation import MISSING_EVIDENCE_PENALTY, ProblemStatementError, load_problem_statement
 from .ranking import (
     BucketThresholds,
     discover_sources,
@@ -56,6 +56,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--vision-include-noise", action="store_true")
     parser.add_argument("--semantic-timeout", type=float, default=30.0)
     parser.add_argument("--fresh-semantic", action="store_true")
+    parser.add_argument(
+        "--missing-evidence-penalty",
+        type=float,
+        default=MISSING_EVIDENCE_PENALTY,
+        help="points deducted per distinct missing-evidence item",
+    )
     parser.add_argument("--excellent-threshold", type=float, default=85.0)
     parser.add_argument("--strong-threshold", type=float, default=70.0)
     parser.add_argument("--promising-threshold", type=float, default=55.0)
@@ -103,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
             vision_include_noise=args.vision_include_noise,
             semantic_timeout=args.semantic_timeout,
             fresh_semantic=args.fresh_semantic,
+            missing_evidence_penalty=args.missing_evidence_penalty,
             thresholds=thresholds,
         )
     except (OSError, ProblemStatementError, ValueError) as exc:

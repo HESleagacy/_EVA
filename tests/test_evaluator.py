@@ -8,6 +8,7 @@ from pptx_forensics import (
     DECK_QUALITY_WEIGHT,
     EVALUATOR_SCHEMA_VERSION,
     PROPOSAL_STRENGTH_WEIGHT,
+    REVIEW_AREAS,
     RUBRIC_VERSION,
     SEMANTIC_COMPONENTS,
     compute_deterministic_metrics,
@@ -15,6 +16,7 @@ from pptx_forensics import (
     extract_pptx,
     reconstruct_raster_diagrams,
     validate_problem_statement,
+    validate_semantic_payload,
 )
 from pptx_forensics.evaluate_cli import main as evaluate_cli_main
 
@@ -157,6 +159,49 @@ def _semantic_response(score: float = 80.0) -> dict[str, Any]:
     }
 
 
+def _review_response() -> dict[str, Any]:
+    response = _semantic_response()
+    response["review"] = {
+        "area_reviews": [
+            {
+                "area": area,
+                "rating": 8.0,
+                "reason": f"Evidence supports {area}.",
+                "evidence_slides": [1],
+                "missing_evidence": [],
+            }
+            for area in REVIEW_AREAS
+        ],
+        "strengths": [{"point": "The proposal is coherent.", "evidence_slides": [1]}],
+        "risks": [{"title": "Validation gap", "detail": "More field evidence is needed.", "evidence_slides": [1]}],
+        "next_evidence": ["Show an unseen-vehicle trial."],
+        "decision": "advance_to_demo",
+        "limitations": ["Linked repositories were not inspected."],
+    }
+    return response
+
+
+def test_semantic_review_payload_is_strict_and_exposed(tmp_path: Path) -> None:
+    response = _review_response()
+    valid, error = validate_semantic_payload(response, [1])
+    assert valid, error
+
+    source = tmp_path / "review.pptx"
+    _feature_package(source)
+    report = extract_pptx(source)
+
+    class Adapter:
+        name = "mock"
+        version = "mock-1"
+
+        def analyze(self, prompt: str, images: list[Any], timeout: float) -> dict[str, Any]:
+            return _review_response()
+
+    result = evaluate_deck(report, PROBLEM, semantic_adapter=Adapter(), semantic_cache_dir=tmp_path / "cache")
+    assert result["review"]["decision"] == "advance_to_demo"
+    assert result["semantic"]["review"]["limitations"] == ["Linked repositories were not inspected."]
+
+
 def test_problem_statement_weights_are_normalized() -> None:
     problem = validate_problem_statement(PROBLEM)
 
@@ -236,14 +281,26 @@ def test_missing_evidence_penalizes_component_and_weighted_scores(tmp_path: Path
     alignment = result["scores"]["proposal_strength"]["components"]["problem_statement_alignment"]
 
     assert alignment["unpenalized_score"] == 85.0
-    assert alignment["missing_evidence_penalty"] == 30.0
-    assert alignment["score"] == 55.0
-    assert result["scores"]["proposal_strength"]["missing_evidence_penalty"] == 9.0
-    assert result["scores"]["proposal_strength"]["score"] == 68.5
+    assert alignment["missing_evidence_penalty"] == 50.0
+    assert alignment["score"] == 35.0
+    assert result["scores"]["proposal_strength"]["missing_evidence_penalty"] == 15.0
+    assert result["scores"]["proposal_strength"]["score"] == 62.5
     assert any(
         item["category"] == "explanation_completeness"
         for item in result["findings"]["weaknesses"]
     )
+
+    custom = evaluate_deck(
+        report,
+        PROBLEM,
+        semantic_adapter=Adapter(),
+        semantic_cache_dir=tmp_path / "custom-cache",
+        missing_evidence_penalty=5.0,
+    )
+    custom_alignment = custom["scores"]["proposal_strength"]["components"]["problem_statement_alignment"]
+    assert custom["missing_evidence_penalty_per_item"] == 5.0
+    assert custom_alignment["missing_evidence_penalty"] == 10.0
+    assert custom_alignment["score"] == 75.0
 
 
 def test_content_visual_and_space_rubric_signals_produce_findings(tmp_path: Path) -> None:

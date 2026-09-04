@@ -436,6 +436,10 @@ evaluate-deck \
   --output evidence/input/evaluation.json
 ```
 
+Missing evidence has a high default penalty of 25 points per distinct item.
+Override it explicitly with `--missing-evidence-penalty` when a rubric requires
+a different policy.
+
 For a structural-only run when no problem statement exists:
 
 ```bash
@@ -495,6 +499,12 @@ ID. The default buckets are `A - Excellent` (85-100), `B - Strong` (70-84.99),
 The output directory contains only Markdown files: one `report.md` per
 submission and one `ranking.md` grouped by PS. Intermediate DeckIR, evidence,
 and cache data are kept outside the output directory.
+
+When semantic evaluation is available, each submission report also contains an
+evidence-grounded reviewer assessment with five area ratings, strengths, risks,
+limitations, a decision, and the next evidence requested. Linked repositories
+and external PS pages are not browsed; missing evidence is reported and
+penalized rather than guessed.
 
 ### Output Layout
 
@@ -763,7 +773,7 @@ The final score is available only when both weighted groups have scores:
 
 `final_score = 0.70 * proposal_strength + 0.30 * deck_quality`.
 
-Each distinct missing-evidence item applies a 15-point penalty to its scored
+Each distinct missing-evidence item applies a 25-point penalty to its scored
 component. Weighted groups expose the original score and total penalty in
 `unpenalized_score` and `missing_evidence_penalty`.
 

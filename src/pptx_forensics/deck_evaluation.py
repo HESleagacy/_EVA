@@ -34,7 +34,7 @@ SEMANTIC_MODEL = "gemini-2.5-flash"
 SCORE_SCALE = 100.0
 PROPOSAL_STRENGTH_WEIGHT = 0.70
 DECK_QUALITY_WEIGHT = 0.30
-MISSING_EVIDENCE_PENALTY = 15.0
+MISSING_EVIDENCE_PENALTY = 25.0
 
 SEMANTIC_COMPONENTS = (
     "problem_statement_alignment",
@@ -43,6 +43,14 @@ SEMANTIC_COMPONENTS = (
     "innovation",
     "impact",
 )
+REVIEW_AREAS = (
+    "fit_to_problem",
+    "technical_approach",
+    "validation_presented",
+    "differentiation",
+    "presentation",
+)
+REVIEW_DECISIONS = ("advance_to_demo", "needs_revision", "do_not_advance")
 PROPOSAL_COMPONENT_WEIGHTS = {
     "problem_statement_alignment": 0.30,
     "solution_clarity": 0.20,
@@ -903,6 +911,7 @@ def _weighted_group(
     component_scores: Mapping[str, Mapping[str, Any]],
     weights: Mapping[str, float],
     explanation: str,
+    missing_evidence_penalty: float,
 ) -> dict[str, Any]:
     components: dict[str, dict[str, Any]] = {}
     missing: list[str] = []
@@ -923,7 +932,7 @@ def _weighted_group(
         elif source.get("confidence") is not None:
             weighted_confidence += weight * float(source["confidence"])
             raw_score = _number(source["score"])
-            penalty = min(raw_score, MISSING_EVIDENCE_PENALTY * len(source_missing)) if raw_score is not None else 0.0
+            penalty = min(raw_score, missing_evidence_penalty * len(source_missing)) if raw_score is not None else 0.0
             if penalty:
                 source["unpenalized_score"] = round(raw_score, 6)
                 source["missing_evidence_penalty"] = round(penalty, 6)
@@ -1359,6 +1368,7 @@ def _evaluation_fingerprint(
     metrics: Mapping[str, Any],
     metric_details: Mapping[str, Any],
     semantic: Mapping[str, Any],
+    missing_evidence_penalty: float,
 ) -> str:
     semantic_identity = dict(semantic)
     semantic_identity.pop("cache_hit", None)
@@ -1376,6 +1386,7 @@ def _evaluation_fingerprint(
                 "deck_quality": DECK_QUALITY_WEIGHT,
                 "proposal_components": PROPOSAL_COMPONENT_WEIGHTS,
                 "deck_components": DECK_COMPONENT_WEIGHTS,
+                "missing_evidence_penalty": missing_evidence_penalty,
             },
             "semantic": semantic_identity,
         }
@@ -1409,6 +1420,50 @@ def _semantic_schema() -> dict[str, Any]:
         },
         "required": ["score", "confidence", "evidence_slides", "explanation", "missing_evidence"],
     }
+    review_area = {
+        "type": "OBJECT",
+        "properties": {
+            "area": {"type": "STRING", "enum": list(REVIEW_AREAS)},
+            "rating": {"type": "NUMBER"},
+            "reason": {"type": "STRING"},
+            "evidence_slides": {"type": "ARRAY", "items": {"type": "INTEGER"}},
+            "missing_evidence": {"type": "ARRAY", "items": {"type": "STRING"}},
+        },
+        "required": ["area", "rating", "reason", "evidence_slides", "missing_evidence"],
+    }
+    review = {
+        "type": "OBJECT",
+        "properties": {
+            "area_reviews": {"type": "ARRAY", "items": review_area},
+            "strengths": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "point": {"type": "STRING"},
+                        "evidence_slides": {"type": "ARRAY", "items": {"type": "INTEGER"}},
+                    },
+                    "required": ["point", "evidence_slides"],
+                },
+            },
+            "risks": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "title": {"type": "STRING"},
+                        "detail": {"type": "STRING"},
+                        "evidence_slides": {"type": "ARRAY", "items": {"type": "INTEGER"}},
+                    },
+                    "required": ["title", "detail", "evidence_slides"],
+                },
+            },
+            "next_evidence": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "decision": {"type": "STRING", "enum": list(REVIEW_DECISIONS)},
+            "limitations": {"type": "ARRAY", "items": {"type": "STRING"}},
+        },
+        "required": ["area_reviews", "strengths", "risks", "next_evidence", "decision", "limitations"],
+    }
     return {
         "type": "OBJECT",
         "properties": {
@@ -1418,15 +1473,16 @@ def _semantic_schema() -> dict[str, Any]:
                 "properties": {key: component for key in SEMANTIC_COMPONENTS},
                 "required": list(SEMANTIC_COMPONENTS),
             },
+            "review": review,
         },
         "required": ["schema_version", "scores"],
     }
 
 
 def validate_semantic_payload(value: Any, slide_numbers: Sequence[int] = ()) -> tuple[bool, str]:
-    """Validate the strict, score-only Gemini response contract."""
-    if not isinstance(value, Mapping) or set(value) != {"schema_version", "scores"}:
-        return False, "semantic response must contain exactly schema_version and scores"
+    """Validate the strict Gemini score and reviewer-response contract."""
+    if not isinstance(value, Mapping) or not {"schema_version", "scores"} <= set(value) or set(value) - {"schema_version", "scores", "review"}:
+        return False, "semantic response contains unsupported or missing top-level fields"
     if value.get("schema_version") != SEMANTIC_SCHEMA_VERSION:
         return False, "semantic response schema version is unsupported"
     scores = value.get("scores")
@@ -1450,6 +1506,66 @@ def validate_semantic_payload(value: Any, slide_numbers: Sequence[int] = ()) -> 
             return False, f"semantic component {component} references an unknown slide"
         if not isinstance(item.get("explanation"), str) or not isinstance(item.get("missing_evidence"), list) or not all(isinstance(item, str) for item in item["missing_evidence"]):
             return False, f"semantic component {component} has invalid evidence text"
+    if "review" in value:
+        valid, error = _validate_review_payload(value["review"], allowed_slides)
+        if not valid:
+            return False, error
+    return True, "ok"
+
+
+def _validate_review_payload(value: Any, allowed_slides: set[int]) -> tuple[bool, str]:
+    required = {"area_reviews", "strengths", "risks", "next_evidence", "decision", "limitations"}
+    if not isinstance(value, Mapping) or set(value) != required:
+        return False, "semantic review has an invalid schema"
+    if value.get("decision") not in REVIEW_DECISIONS:
+        return False, "semantic review has an invalid decision"
+    for key in ("next_evidence", "limitations"):
+        items = value.get(key)
+        if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+            return False, f"semantic review {key} must be a string array"
+    areas = value.get("area_reviews")
+    if not isinstance(areas, list) or len(areas) != len(REVIEW_AREAS):
+        return False, "semantic review must contain one record for every review area"
+    area_names: set[str] = set()
+    for item in areas:
+        if not isinstance(item, Mapping) or set(item) != {"area", "rating", "reason", "evidence_slides", "missing_evidence"}:
+            return False, "semantic review area has an invalid schema"
+        area = item.get("area")
+        if area not in REVIEW_AREAS or area in area_names:
+            return False, "semantic review areas must be unique and supported"
+        area_names.add(str(area))
+        rating = _number(item.get("rating"))
+        if rating is None or not 0 <= rating <= 10:
+            return False, "semantic review area has an invalid rating"
+        if not isinstance(item.get("reason"), str) or not isinstance(item.get("missing_evidence"), list) or not all(isinstance(entry, str) for entry in item["missing_evidence"]):
+            return False, "semantic review area has invalid explanation text"
+        valid, error = _validate_review_slides(item.get("evidence_slides"), allowed_slides)
+        if not valid:
+            return False, error
+    if area_names != set(REVIEW_AREAS):
+        return False, "semantic review is missing a review area"
+    for key in ("strengths", "risks"):
+        items = value.get(key)
+        if not isinstance(items, list):
+            return False, f"semantic review {key} must be an array"
+        for item in items:
+            expected = {"point", "evidence_slides"} if key == "strengths" else {"title", "detail", "evidence_slides"}
+            if not isinstance(item, Mapping) or set(item) != expected:
+                return False, f"semantic review {key} has an invalid record"
+            text_keys = ("point",) if key == "strengths" else ("title", "detail")
+            if any(not isinstance(item[text_key], str) for text_key in text_keys):
+                return False, f"semantic review {key} has invalid text"
+            valid, error = _validate_review_slides(item.get("evidence_slides"), allowed_slides)
+            if not valid:
+                return False, error
+    return True, "ok"
+
+
+def _validate_review_slides(value: Any, allowed_slides: set[int]) -> tuple[bool, str]:
+    if not isinstance(value, list) or any(_number(slide) is None or _number(slide) < 1 for slide in value):
+        return False, "semantic review has invalid evidence slides"
+    if allowed_slides and any(int(_number(slide)) not in allowed_slides for slide in value):
+        return False, "semantic review references an unknown slide"
     return True, "ok"
 
 
@@ -1594,7 +1710,15 @@ def _semantic_prompt(ir: EvaluatorIR, problem: ProblemStatement | None) -> str:
         "Always provide a numeric confidence even when evidence is weak or missing. "
         "Cite only slide numbers that support the component. If evidence is absent, list it in "
         "missing_evidence and do not infer it from presentation polish. Do not return nodes, edges, "
-        "rankings, or any fields outside the schema.\n\n"
+        "rankings, or any fields outside the schema. Also provide a reviewer object with exactly "
+        "one 0-10 rating and evidence-grounded reason for each area: fit_to_problem, "
+        "technical_approach, validation_presented, differentiation, and presentation. List "
+        "concrete strengths, specific risks that prevent a higher rating, the next evidence that "
+        "would most improve confidence, a decision of advance_to_demo, needs_revision, or "
+        "do_not_advance, and limitations. Do not browse or retrieve linked repositories, papers, "
+        "or external PS documents; explicitly state that limitation when relevant. Treat broad "
+        "claims, contradictions, missing baselines, unsupported deployments, and unclear metrics "
+        "as risks.\n\n"
         + json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
 
@@ -1666,7 +1790,7 @@ def evaluate_semantics(
             [_slide_number(slide, index) for index, slide in enumerate(_slides(ir), 1)],
         )
     if cached is not None:
-        return {
+        result = {
             "schema_version": SEMANTIC_SCHEMA_VERSION,
             "model": SEMANTIC_MODEL,
             "status": "available",
@@ -1683,6 +1807,9 @@ def evaluate_semantics(
                 for key in SEMANTIC_COMPONENTS
             },
         }
+        if isinstance(cached.get("review"), Mapping):
+            result["review"] = dict(cached["review"])
+        return result
 
     semantic_adapter = adapter or GeminiSemanticAdapter(api_key=api_key)
     if isinstance(semantic_adapter, GeminiSemanticAdapter) and not semantic_adapter.api_key:
@@ -1705,7 +1832,7 @@ def evaluate_semantics(
         result["content_hash"] = content_hash
         return result
     _write_semantic_cache(cache_path, content_hash, response)
-    return {
+    result = {
         "schema_version": SEMANTIC_SCHEMA_VERSION,
         "model": SEMANTIC_MODEL,
         "status": "available",
@@ -1722,6 +1849,9 @@ def evaluate_semantics(
             for key in SEMANTIC_COMPONENTS
         },
     }
+    if isinstance(response.get("review"), Mapping):
+        result["review"] = dict(response["review"])
+    return result
 
 
 def evaluate_deck(
@@ -1736,6 +1866,7 @@ def evaluate_deck(
     semantic_timeout: float = 30.0,
     skip_semantic: bool = False,
     fresh_semantic: bool = False,
+    missing_evidence_penalty: float = MISSING_EVIDENCE_PENALTY,
 ) -> dict[str, Any]:
     """Evaluate a deck from canonical DeckIR or compact EvaluatorIR data."""
     if isinstance(value, EvaluatorIR):
@@ -1748,6 +1879,11 @@ def evaluate_deck(
         )
     else:
         ir = build_evaluator_ir(value)
+    if isinstance(missing_evidence_penalty, bool):
+        raise ValueError("missing evidence penalty must be a non-negative finite number")
+    penalty_value = _number(missing_evidence_penalty)
+    if penalty_value is None or penalty_value < 0:
+        raise ValueError("missing evidence penalty must be a non-negative finite number")
     metrics, metric_details = compute_deterministic_metrics(ir)
     deterministic = _deterministic_scores(metrics, metric_details)
 
@@ -1786,12 +1922,14 @@ def evaluate_deck(
         proposal_components,
         PROPOSAL_COMPONENT_WEIGHTS,
         "Proposal strength combines problem alignment, solution clarity, feasibility, innovation, impact, and concrete prototype evidence.",
+        penalty_value,
     )
     deck_quality = _weighted_group(
         "deck_quality",
         {key: deterministic[key] for key in DECK_COMPONENT_WEIGHTS},
         DECK_COMPONENT_WEIGHTS,
         "Deck quality combines readability, layout consistency, visual hierarchy, evidence visibility, content originality, pointer-friendly content structure, visual coverage, and space usage.",
+        penalty_value,
     )
     final_missing = []
     if proposal["score"] is None:
@@ -1814,12 +1952,20 @@ def evaluate_deck(
         [*final_missing, *proposal.get("missing_evidence", []), *deck_quality.get("missing_evidence", [])],
     )
     findings = _build_findings(metrics, metric_details, deterministic, semantic)
-    evaluation_fingerprint = _evaluation_fingerprint(ir, problem_statement, metrics, metric_details, semantic)
+    evaluation_fingerprint = _evaluation_fingerprint(
+        ir,
+        problem_statement,
+        metrics,
+        metric_details,
+        semantic,
+        penalty_value,
+    )
     return {
         "schema_version": EVALUATION_SCHEMA_VERSION,
         "rubric_version": RUBRIC_VERSION,
         "evaluation_fingerprint": evaluation_fingerprint,
         "score_scale": SCORE_SCALE,
+        "missing_evidence_penalty_per_item": penalty_value,
         "weights": {
             "proposal_strength": PROPOSAL_STRENGTH_WEIGHT,
             "deck_quality": DECK_QUALITY_WEIGHT,
@@ -1830,6 +1976,7 @@ def evaluate_deck(
         "metrics": metrics,
         "metric_details": metric_details,
         "semantic": semantic,
+        "review": semantic.get("review"),
         "findings": findings,
         "scores": {
             "proposal_strength": proposal,
