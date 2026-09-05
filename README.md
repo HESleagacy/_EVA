@@ -104,9 +104,9 @@ Use the smallest profile that satisfies the job:
 | Repository test job | `.[pptx,test,ocr]` | Unit and regression tests; Tesseract is only needed for OCR paths |
 
 For production, build a wheel in CI and install that artifact in an isolated
-runtime. The repository currently has no lockfile, Dockerfile, or CI workflow;
-pin the Python version and resolved dependency versions in the deployment
-system or an external constraints file.
+runtime, or use the root `Dockerfile`. The repository currently has no lockfile
+or CI workflow; pin the Python version and resolved dependency versions in the
+deployment system or an external constraints file.
 
 ### Production Installation
 
@@ -119,6 +119,34 @@ source /opt/pptx-forensics/venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install ".[pptx]"
 ```
+
+### Container Image
+
+Build the single root image. The build excludes local evidence, caches,
+credentials, and input documents; mount those directories at runtime instead.
+
+```bash
+docker build -t document-forensics .
+docker run --rm document-forensics
+```
+
+To process mounted input and output directories, override the image command with
+one of the installed CLI tools:
+
+```bash
+docker run --rm \
+  --mount "type=bind,src=$PWD/input,dst=/workspace/input,readonly" \
+  --mount "type=bind,src=$PWD/output,dst=/workspace/output" \
+  --entrypoint pptx-forensics \
+  document-forensics \
+  /workspace/input/document.pdf \
+  --evidence-dir /workspace/output/job \
+  --output /workspace/output/report.md
+```
+
+The image has no bundled input or evidence data. Keep API keys in environment
+variables or the container runtime secret store, not in the image or command
+line.
 
 Install the optional extras only in images or workers that use them:
 
