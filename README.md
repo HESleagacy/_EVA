@@ -122,28 +122,38 @@ python -m pip install ".[pptx]"
 
 ### Container Image
 
-Build the single root image. The build excludes local evidence, caches,
-credentials, and input documents; mount those directories at runtime instead.
+Build the container image:
 
 ```bash
 docker build -t document-forensics .
-docker run --rm document-forensics
 ```
 
-To process mounted input and output directories, override the image command with
-one of the installed CLI tools:
+Run the container to automatically process all presentations from the bundled `submissions.tsv`:
 
 ```bash
 docker run --rm \
-  --user "$(id -u):$(id -g)" \
-  --env GEMINI_API_KEY \
-  --env XDG_CACHE_HOME=/tmp/document-forensics-cache \
-  --mount "type=bind,src=$PWD/submissions,dst=/workspace/submissions,readonly" \
-  --mount "type=bind,src=$PWD/evidence,dst=/workspace/evidence" \
-  --entrypoint review-submissions \
-  document-forensics \
-  --problem-cache-dir /tmp/problem-statements \
-  --sih-url https://www.sih.gov.in/sih2026PS
+  --env-file .env \
+  -v "$PWD/evidence:/workspace/evidence" \
+  document-forensics
+```
+
+The container automatically:
+- Sequentially streams each submission URL from the manifest into an isolated sandbox.
+- Extracts native structure, renders slides, runs OCR, and reconstructs diagrams.
+- Automatically infers the official Problem Statement ID and scrapes requirements from the SIH portal.
+- Evaluates against the rubric with Gemini multimodal vision and semantic scoring (when `GEMINI_API_KEY` is configured in `.env`, or notes "gemini key unavailable" otherwise).
+- Writes individual reports into `evidence/<ps_id>/<team>-<hash>/report.md` and generates `evidence/ranking.md`.
+- Purges the temporary downloaded file immediately after each submission (Option A).
+- Cleanly stops when all submissions are completed.
+
+To process a custom manifest file or directory instead:
+
+```bash
+docker run --rm \
+  --env-file .env \
+  -v "$PWD/custom_manifest.tsv:/workspace/submissions.tsv:ro" \
+  -v "$PWD/evidence:/workspace/evidence" \
+  document-forensics review-submissions --manifest /workspace/submissions.tsv
 ```
 
 The image has no bundled input or evidence data. Keep API keys in environment
@@ -520,12 +530,19 @@ stable path order and processes exactly one submission at a time:
 review-submissions
 ```
 
-The default input is `./submissions` and the default Markdown output is
-`./evidence`. Every discovered supported file gets a report, including a
+The default input is `./submissions` (or `submissions.tsv` manifest if present) and the default Markdown output is
+`./evidence`. You can also explicitly pass a TSV or CSV manifest of remote URLs:
+
+```bash
+review-submissions --manifest submissions.tsv
+```
+
+Every discovered or downloaded file gets a report, including a
 `REVIEW` report when extraction, problem lookup, or evaluation fails; one bad
-file does not stop the remaining files. Use `--quiet` only to hide progress
-messages. The existing `rank-submissions` command is an equivalent name when
-explicit batch options are preferred.
+file does not stop the remaining files. Each downloaded file is processed in an
+isolated temporary directory and purged immediately after its report is written.
+Use `--quiet` only to hide progress messages. The existing `rank-submissions`
+command is an equivalent name when explicit batch options are preferred.
 
 If no `--problem` or `--problem-dir` is supplied, the command reads the PS ID
 from native document text (including tokens such as `SIH26168`) and fetches the
