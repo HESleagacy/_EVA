@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from pptx_forensics.ranking import (
     BucketThresholds,
@@ -8,6 +9,7 @@ from pptx_forensics.ranking import (
     assign_ranks,
     bucket_for_score,
     discover_sources,
+    infer_ps_id,
     render_evaluation_markdown,
     render_ranking_markdown,
 )
@@ -25,6 +27,12 @@ def test_discover_sources_finds_only_supported_submission_types(tmp_path: Path) 
         (nested / "two.PPTX").resolve(),
         (root / "one.pdf").resolve(),
     ]
+
+
+def test_infer_ps_id_reads_official_id_tokens_from_document_text() -> None:
+    report = SimpleNamespace(slides=[SimpleNamespace(text=["SIH 2025; official reference: SIH26168"])])
+
+    assert infer_ps_id(report, "team-submission.pdf") == "26168"
 
 
 def test_bucket_thresholds_and_rank_order_are_deterministic() -> None:

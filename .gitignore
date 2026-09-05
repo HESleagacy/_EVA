@@ -221,5 +221,8 @@ __marimo__/
 .env.*
 !.env.example
 evidence/
+submissions/*
+!submissions/.gitkeep
+problems/
 vendor/aurochs/
 *.pptx

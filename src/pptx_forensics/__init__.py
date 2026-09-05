@@ -63,6 +63,13 @@ from .ranking import (
     render_evaluation_markdown,
     render_ranking_markdown,
 )
+from .problem_scraper import (
+    DEFAULT_SIH_PROBLEM_URL,
+    OfficialProblemScraper,
+    ProblemScrapeError,
+    normalize_problem_id,
+    parse_sih_problem_page,
+)
 
 __all__ = [
     "DeckIR",
@@ -150,4 +157,9 @@ __all__ = [
     "rank_submissions",
     "render_evaluation_markdown",
     "render_ranking_markdown",
+    "DEFAULT_SIH_PROBLEM_URL",
+    "OfficialProblemScraper",
+    "ProblemScrapeError",
+    "normalize_problem_id",
+    "parse_sih_problem_page",
 ]

@@ -27,4 +27,4 @@ RUN addgroup --system app \
 USER app
 WORKDIR /workspace
 
-CMD ["pptx-forensics", "--help"]
+CMD ["review-submissions", "--help"]

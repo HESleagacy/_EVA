@@ -8,6 +8,7 @@ import sys
 from typing import Any
 
 from .deck_evaluation import MISSING_EVIDENCE_PENALTY, ProblemStatementError, load_problem_statement
+from .problem_scraper import DEFAULT_SIH_PROBLEM_URL, OfficialProblemScraper
 from .ranking import (
     BucketThresholds,
     discover_sources,
@@ -18,20 +19,33 @@ from .ranking import (
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Evaluate and rank PPTX/PDF submissions by problem statement"
+        description="Process local document submissions sequentially and rank them by problem statement"
     )
-    parser.add_argument("sources", nargs="*", type=Path, help="PPTX/PDF files to evaluate")
+    parser.add_argument("sources", nargs="*", type=Path, help="specific supported files; defaults to the submissions folder")
     parser.add_argument(
         "--input-dir",
         action="append",
         type=Path,
-        help="directory containing submissions; repeat for multiple directories",
+        help="directory containing submissions; defaults to ./submissions and may be repeated",
     )
-    problem_group = parser.add_mutually_exclusive_group(required=True)
-    problem_group.add_argument("--problem", type=Path, help="one weighted PS JSON applied to every submission")
-    problem_group.add_argument("--problem-dir", type=Path, help="directory of weighted PS JSON files keyed by PS ID")
+    problem_group = parser.add_mutually_exclusive_group()
+    problem_group.add_argument("--problem", type=Path, help="one weighted problem JSON applied to every submission")
+    problem_group.add_argument("--problem-dir", type=Path, help="directory of weighted problem JSON files keyed by ID")
+    parser.add_argument(
+        "--sih-url",
+        default=DEFAULT_SIH_PROBLEM_URL,
+        help="official problem-statement page used when --problem/--problem-dir is omitted",
+    )
+    parser.add_argument(
+        "--problem-cache-dir",
+        type=Path,
+        default=Path(".cache/problem-statements"),
+        help="local cache for the deterministic official problem-page scrape",
+    )
+    parser.add_argument("--sih-timeout", type=float, default=20.0, help="official problem-page request timeout in seconds")
+    parser.add_argument("--refresh-problems", action="store_true", help="refresh the official problem-page cache")
     parser.add_argument("--ps-id", help="override the PS ID for every submission")
-    parser.add_argument("--output-dir", type=Path, required=True, help="directory for Markdown-only output")
+    parser.add_argument("--output-dir", type=Path, default=Path("evidence"), help="local Markdown output directory")
     parser.add_argument("--no-recursive", action="store_true", help="do not scan input directories recursively")
     parser.add_argument("--native-only", action="store_true", help="skip rendering, OCR, diagrams, and vision")
     parser.add_argument("--skip-render", action="store_true", help="skip slide/page rendering")
@@ -65,16 +79,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--excellent-threshold", type=float, default=85.0)
     parser.add_argument("--strong-threshold", type=float, default=70.0)
     parser.add_argument("--promising-threshold", type=float, default=55.0)
+    parser.add_argument("--quiet", action="store_true", help="suppress per-submission progress messages")
     args = parser.parse_args(argv)
 
     try:
+        input_dirs = args.input_dir
+        if input_dirs is None and not args.sources:
+            input_dirs = [Path("submissions")]
         sources = discover_sources(
             args.sources,
-            args.input_dir or (),
+            input_dirs or (),
             recursive=not args.no_recursive,
         )
         problem = load_problem_statement(args.problem) if args.problem else None
-        problem_resolver = _problem_resolver(args.problem_dir) if args.problem_dir else None
+        if args.problem_dir:
+            problem_resolver = _problem_resolver(args.problem_dir)
+        elif problem is None:
+            problem_resolver = OfficialProblemScraper(
+                args.sih_url,
+                cache_dir=args.problem_cache_dir,
+                timeout=args.sih_timeout,
+                refresh=args.refresh_problems,
+            ).resolve
+        else:
+            problem_resolver = None
         thresholds = BucketThresholds(
             excellent=args.excellent_threshold,
             strong=args.strong_threshold,
@@ -111,12 +139,18 @@ def main(argv: list[str] | None = None) -> int:
             fresh_semantic=args.fresh_semantic,
             missing_evidence_penalty=args.missing_evidence_penalty,
             thresholds=thresholds,
+            progress=None if args.quiet else _progress,
         )
     except (OSError, ProblemStatementError, ValueError) as exc:
         parser.error(str(exc))
     scored = sum(result.final_score is not None for result in results)
-    print(f"Evaluated {len(results)} submissions; {scored} scored; Markdown output: {args.output_dir}")
+    failed = sum(result.status == "failed" for result in results)
+    print(f"Evaluated {len(results)} submissions sequentially; {scored} scored; {failed} failed; Markdown output: {args.output_dir}")
     return 0
+
+
+def _progress(index: int, total: int, source: Path) -> None:
+    print(f"[{index}/{total}] Processing {source.name}", file=sys.stderr)
 
 
 def _problem_resolver(problem_dir: Path):

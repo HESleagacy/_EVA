@@ -23,6 +23,8 @@ ocr = ["Pillow>=9.0"]
 pptx-forensics = "pptx_forensics.cli:main"
 evaluate-deck = "pptx_forensics.evaluate_cli:main"
 rank-submissions = "pptx_forensics.rank_cli:main"
+review-submissions = "pptx_forensics.rank_cli:main"
+scrape-problem = "pptx_forensics.problem_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

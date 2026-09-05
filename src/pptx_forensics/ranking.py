@@ -21,6 +21,7 @@ from .deck_evaluation import (
 from .diagrams import reconstruct_raster_diagrams
 from .extractor import extract_document
 from .ocr import run_ocr
+from .problem_scraper import normalize_problem_id
 from .render import render_selected_pdf_pages, render_selected_slides
 from .vision import DEFAULT_MAX_OUTPUT_TOKENS, run_selective_vision
 
@@ -28,6 +29,7 @@ from .vision import DEFAULT_MAX_OUTPUT_TOKENS, run_selective_vision
 SUPPORTED_INPUT_SUFFIXES = frozenset({".pdf", ".pptx"})
 RANKING_SCHEMA_VERSION = "submission-ranking-1.0"
 _PS_ID_PATTERNS = (
+    re.compile(r"\bsih\s*[-_:#]?\s*(\d{5,8})\b", re.IGNORECASE),
     re.compile(
         r"problem\s+statement\s+(?:id|number|no)\s*[:#\-–—]?\s*([A-Za-z0-9][A-Za-z0-9_-]*)",
         re.IGNORECASE,
@@ -90,10 +92,7 @@ class SubmissionResult:
 
 def normalize_ps_id(value: Any) -> str:
     """Normalize PS labels so ``PS-26168`` and ``26168`` group together."""
-    text = str(value or "").strip()
-    text = re.sub(r"^(?:problem[-_ ]?statement|problem|ps)[-_ ]*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-").upper()
-    return text or "UNASSIGNED"
+    return normalize_problem_id(value)
 
 
 def safe_slug(value: Any, fallback: str = "submission") -> str:
@@ -302,6 +301,7 @@ def rank_submissions(
     fresh_semantic: bool = False,
     missing_evidence_penalty: float = MISSING_EVIDENCE_PENALTY,
     thresholds: BucketThresholds = BucketThresholds(),
+    progress: Callable[[int, int, Path], None] | None = None,
 ) -> list[SubmissionResult]:
     """Evaluate, rank, bucket, and write Markdown-only submission outputs."""
     if problem is not None and problem_resolver is not None:
@@ -314,8 +314,10 @@ def rank_submissions(
     output_root = Path(output_dir).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     results: list[SubmissionResult] = []
-    for raw_source in sources:
+    for index, raw_source in enumerate(sources, 1):
         source = Path(raw_source).expanduser().resolve()
+        if progress is not None:
+            progress(index, len(sources), source)
         result = _process_submission(
             source,
             single_problem=single_problem,

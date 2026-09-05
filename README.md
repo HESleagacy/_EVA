@@ -135,13 +135,15 @@ one of the installed CLI tools:
 
 ```bash
 docker run --rm \
-  --mount "type=bind,src=$PWD/input,dst=/workspace/input,readonly" \
-  --mount "type=bind,src=$PWD/output,dst=/workspace/output" \
-  --entrypoint pptx-forensics \
+  --user "$(id -u):$(id -g)" \
+  --env GEMINI_API_KEY \
+  --env XDG_CACHE_HOME=/tmp/document-forensics-cache \
+  --mount "type=bind,src=$PWD/submissions,dst=/workspace/submissions,readonly" \
+  --mount "type=bind,src=$PWD/evidence,dst=/workspace/evidence" \
+  --entrypoint review-submissions \
   document-forensics \
-  /workspace/input/document.pdf \
-  --evidence-dir /workspace/output/job \
-  --output /workspace/output/report.md
+  --problem-cache-dir /tmp/problem-statements \
+  --sih-url https://www.sih.gov.in/sih2026PS
 ```
 
 The image has no bundled input or evidence data. Keep API keys in environment
@@ -202,7 +204,9 @@ are job evidence and local caches:
 
 | Location | Contents | Safe to remove |
 | --- | --- | --- |
+| `submissions/` | Local input PDF and PPTX files processed sequentially | Yes; keep the originals elsewhere if needed |
 | `evidence/<job>/` | Original PPTX, package parts, reports, renders, and evidence records | Yes after retention requirements are met; it cannot be reconstructed without the input |
+| `problems/` | Optional locally saved official problem-statement JSON snapshots | Yes; they can be fetched again |
 | `$XDG_CACHE_HOME/pptx-forensics/render/` | Aurochs SVGs keyed by source, slide, and renderer version | Yes; the next render rebuilds it |
 | `$XDG_CACHE_HOME/pptx-forensics/ocr/` | Validated OCR results keyed by asset and OCR engine settings | Yes; the next OCR run rebuilds it |
 | `$XDG_CACHE_HOME/pptx-forensics/vision/` | Validated Gemini responses and usage metadata | Yes; deleting it may create new API calls and cost |
@@ -505,10 +509,55 @@ SVG evidence; provide rasterized slide images separately if Gemini should use
 rendered pixels. No model score is inferred when the request, response schema,
 or supporting evidence is unavailable.
 
-### Batch Submission Ranking
+### Local Sequential Workflow
 
-Use `rank-submissions` when several PPTX or PDF submissions target the same
-problem statement. Provide one validated weighted problem JSON for that group:
+Put every submission PDF or PPTX file in the root
+`submissions/` directory. Supported extensions are `.pdf` and `.pptx`.
+Nested directories are scanned too. The local command discovers files in a
+stable path order and processes exactly one submission at a time:
+
+```bash
+review-submissions
+```
+
+The default input is `./submissions` and the default Markdown output is
+`./evidence`. Every discovered supported file gets a report, including a
+`REVIEW` report when extraction, problem lookup, or evaluation fails; one bad
+file does not stop the remaining files. Use `--quiet` only to hide progress
+messages. The existing `rank-submissions` command is an equivalent name when
+explicit batch options are preferred.
+
+If no `--problem` or `--problem-dir` is supplied, the command reads the PS ID
+from native document text (including tokens such as `SIH26168`) and fetches the
+matching official record from the configured problem page. This lookup is
+deterministic: it parses the server-rendered HTML, derives weighted requirements
+from the published expected-solution bullets, and caches the validated result
+under `.cache/problem-statements`. No model is used to choose the PS.
+
+```bash
+review-submissions --refresh-problems
+```
+
+To fetch one official problem statement explicitly:
+
+```bash
+scrape-problem 26168 --output problems/26168.json
+```
+
+For an offline run, use the cached or locally prepared problem files instead:
+
+```bash
+review-submissions --problem-dir problems
+```
+
+Use `--sih-url` to select another official edition page. Set `GEMINI_API_KEY`
+when semantic scoring is wanted; `--skip-semantic` remains available for
+deterministic extraction and review-only processing.
+
+### Explicit Batch Submission Ranking
+
+Use explicit options when several submissions target one known problem
+statement. Provide one validated weighted problem JSON for that group:
 
 ```bash
 rank-submissions \
