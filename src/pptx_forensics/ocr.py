@@ -121,19 +121,26 @@ class TesseractOcrAdapter:
 
     name = "tesseract"
 
-    def __init__(self, language: str = "eng", psm: int = 6, executable: str | None = None) -> None:
+    def __init__(
+        self,
+        language: str = "eng",
+        psm: int = 6,
+        executable: str | None = None,
+        timeout: float = 15.0,
+    ) -> None:
         self.language = language
         self.psm = psm
         self.executable = executable or shutil.which("tesseract")
+        self.timeout = timeout
         self.version = self._version()
 
     def _version(self) -> str:
         if not self.executable:
             return "unavailable"
         try:
-            result = subprocess.run([self.executable, "--version"], capture_output=True, text=True, check=True)
+            result = subprocess.run([self.executable, "--version"], capture_output=True, text=True, check=True, timeout=10.0)
             return result.stdout.splitlines()[0].strip() if result.stdout else "unknown"
-        except (OSError, subprocess.CalledProcessError):
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return "unknown"
 
     def recognize(self, image: bytes, content_type: str) -> OcrResult:
@@ -144,7 +151,9 @@ class TesseractOcrAdapter:
         if not self.executable:
             return OcrResult("ocr_unavailable", "", [], [], width, height, None, "tesseract is not installed")
 
-        suffix = "." + content_type.split("/", 1)[-1].replace("jpeg", "jpg")
+        raw_ext = content_type.split("/", 1)[-1].lower().replace("jpeg", "jpg")
+        suffix = f".{raw_ext}" if raw_ext in {"jpg", "png", "webp", "tiff", "gif", "bmp"} else ".png"
+        env = dict(os.environ, OMP_THREAD_LIMIT="1")
         try:
             with tempfile.NamedTemporaryFile(suffix=suffix) as image_file:
                 image_file.write(image)
@@ -153,8 +162,14 @@ class TesseractOcrAdapter:
                     [self.executable, image_file.name, "stdout", "--psm", str(self.psm), "-l", self.language, "tsv"],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=self.timeout,
+                    env=env,
                     check=False,
                 )
+        except subprocess.TimeoutExpired:
+            return OcrResult("ocr_failed", "", [], [], width, height, None, f"tesseract timed out after {self.timeout}s")
         except OSError as exc:
             return OcrResult("ocr_failed", "", [], [], width, height, None, str(exc))
         if result.returncode != 0:

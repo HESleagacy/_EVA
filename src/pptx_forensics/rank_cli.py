@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -12,6 +13,7 @@ from .problem_scraper import DEFAULT_SIH_PROBLEM_URL, OfficialProblemScraper
 from .ranking import (
     BucketThresholds,
     discover_sources,
+    load_manifest,
     normalize_ps_id,
     rank_submissions,
 )
@@ -22,6 +24,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Process local document submissions sequentially and rank them by problem statement"
     )
     parser.add_argument("sources", nargs="*", type=Path, help="specific supported files; defaults to the submissions folder")
+    parser.add_argument("--manifest", type=Path, help="path to submissions TSV/CSV manifest file")
     parser.add_argument(
         "--input-dir",
         action="append",
@@ -83,14 +86,29 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        input_dirs = args.input_dir
-        if input_dirs is None and not args.sources:
-            input_dirs = [Path("submissions")]
-        sources = discover_sources(
-            args.sources,
-            input_dirs or (),
-            recursive=not args.no_recursive,
-        )
+        manifest_path = args.manifest
+        if manifest_path is None and not args.sources and not args.input_dir:
+            for candidate in (Path("submissions.tsv"), Path("/opt/application/submissions.tsv")):
+                if candidate.is_file():
+                    manifest_path = candidate
+                    break
+
+        manifest_entries = load_manifest(manifest_path) if manifest_path else None
+        if manifest_entries is None:
+            input_dirs = args.input_dir
+            if input_dirs is None and not args.sources:
+                input_dirs = [Path("submissions")]
+            sources = discover_sources(
+                args.sources,
+                input_dirs or (),
+                recursive=not args.no_recursive,
+            )
+        else:
+            sources = ()
+
+        if not os.environ.get("GEMINI_API_KEY") and not args.skip_semantic:
+            print("Note: gemini key unavailable (GEMINI_API_KEY not configured in environment)", file=sys.stderr)
+
         problem = load_problem_statement(args.problem) if args.problem else None
         if args.problem_dir:
             problem_resolver = _problem_resolver(args.problem_dir)
@@ -111,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
         results = rank_submissions(
             sources,
             args.output_dir,
+            manifest=manifest_entries,
             problem=problem,
             problem_resolver=problem_resolver,
             ps_id=args.ps_id,

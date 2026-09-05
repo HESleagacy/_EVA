@@ -10,8 +10,11 @@ WORKDIR /opt/application
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
         poppler-utils \
         tesseract-ocr \
+        wget \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . .
@@ -19,12 +22,12 @@ COPY . .
 RUN python -m pip install --upgrade pip \
     && python -m pip install ".[pptx,ocr,test]"
 
-RUN addgroup --system app \
-    && adduser --system --ingroup app app \
+RUN addgroup --system --gid 1000 app \
+    && adduser --system --uid 1000 --ingroup app app \
     && mkdir -p /workspace "${XDG_CACHE_HOME}" \
     && chown -R app:app /opt/application /workspace "${XDG_CACHE_HOME}"
 
 USER app
 WORKDIR /workspace
 
-CMD ["review-submissions", "--help"]
+CMD ["review-submissions", "--manifest", "/opt/application/submissions.tsv"]

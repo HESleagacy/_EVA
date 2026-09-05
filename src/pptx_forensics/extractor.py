@@ -1176,6 +1176,7 @@ def extract_document(
     include_visual_evidence: bool = True,
     include_native_diagrams: bool = True,
     password: str | None = None,
+    problem_statement: Any = None,
 ) -> ExtractionReport:
     """Dispatch a supported source to its native extraction adapter."""
     source_path = Path(source).expanduser().resolve()
@@ -1189,18 +1190,31 @@ def extract_document(
     if signature.startswith(b"%PDF-"):
         from .pdf import extract_pdf
 
-        return extract_pdf(
+        report = extract_pdf(
             source_path,
             evidence_dir,
             include_visual_evidence=include_visual_evidence,
             include_native_diagrams=include_native_diagrams,
             password=password,
         )
-    if signature.startswith(b"PK"):
-        return extract_pptx(
+    elif signature.startswith(b"PK"):
+        report = extract_pptx(
             source_path,
             evidence_dir,
             include_visual_evidence=include_visual_evidence,
             include_native_diagrams=include_native_diagrams,
         )
-    raise ExtractionError(f"Unsupported source document format: {source_path}")
+    else:
+        raise ExtractionError(f"Unsupported source document format: {source_path}")
+
+    if problem_statement is not None and getattr(report, "canonical", None) is not None:
+        ps_dict = (
+            problem_statement.to_dict()
+            if hasattr(problem_statement, "to_dict")
+            else dict(problem_statement)
+            if isinstance(problem_statement, Mapping)
+            else None
+        )
+        if ps_dict:
+            report.canonical.deck["problem_statement"] = ps_dict
+    return report

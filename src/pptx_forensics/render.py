@@ -444,7 +444,11 @@ def render_selected_pdf_pages(
                     str(prefix),
                 ]
                 try:
-                    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+                    completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30.0)
+                except subprocess.TimeoutExpired:
+                    _warning(report, f"PDF page {page} rendering timed out after 30s")
+                    _set_render_visibility(report, [page], "failed")
+                    continue
                 except OSError as exc:
                     _warning(report, f"PDF page {page} rendering failed to start: {exc}")
                     _set_render_visibility(report, [page], "failed")

@@ -5,11 +5,14 @@ from types import SimpleNamespace
 
 from pptx_forensics.ranking import (
     BucketThresholds,
+    ManifestEntry,
     SubmissionResult,
     assign_ranks,
     bucket_for_score,
     discover_sources,
+    extension_for_url,
     infer_ps_id,
+    load_manifest,
     render_evaluation_markdown,
     render_ranking_markdown,
 )
@@ -136,3 +139,20 @@ def test_ranking_report_groups_problem_statements() -> None:
     assert "# Submission Ranking" in ranking
     assert "## Problem Statement `26168`" in ranking
     assert "| REVIEW | team-a | A | REVIEW | N/A | review |" in ranking
+
+
+def test_load_manifest_and_extension_inference(tmp_path: Path) -> None:
+    manifest_file = tmp_path / "submissions.tsv"
+    manifest_file.write_text(
+        "teamName\tppt\tdemo\n"
+        "Alpha\thttps://example.com/files/doc.pdf\thttps://demo.test/1\n"
+        "Beta\thttps://example.com/files/deck.pptx?token=xyz\t\n",
+        encoding="utf-8",
+    )
+    entries = load_manifest(manifest_file)
+    assert len(entries) == 2
+    assert entries[0].team_name == "Alpha"
+    assert entries[0].url == "https://example.com/files/doc.pdf"
+    assert extension_for_url(entries[0].url) == ".pdf"
+    assert entries[1].team_name == "Beta"
+    assert extension_for_url(entries[1].url) == ".pptx"
