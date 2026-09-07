@@ -6,11 +6,14 @@ from typing import Any
 
 from pptx_forensics import (
     DECK_QUALITY_WEIGHT,
+    DECK_COMPONENT_POINTS,
     EVALUATOR_SCHEMA_VERSION,
     PROPOSAL_STRENGTH_WEIGHT,
+    PROPOSAL_COMPONENT_POINTS,
     REVIEW_AREAS,
     RUBRIC_VERSION,
     SEMANTIC_COMPONENTS,
+    SUBCRITERION_WEIGHTS,
     compute_deterministic_metrics,
     evaluate_deck,
     extract_pptx,
@@ -19,6 +22,7 @@ from pptx_forensics import (
     validate_semantic_payload,
 )
 from pptx_forensics.evaluate_cli import main as evaluate_cli_main
+from pptx_forensics.deck_evaluation import SEMANTIC_SCHEMA_VERSION as DECK_SEMANTIC_SCHEMA_VERSION
 
 from test_extractor import _feature_package
 
@@ -144,17 +148,44 @@ PROBLEM = {
 
 
 def _semantic_response(score: float = 80.0) -> dict[str, Any]:
+    fixed_ids = {
+        key: tuple(SUBCRITERION_WEIGHTS[key])
+        for key in SUBCRITERION_WEIGHTS
+    }
     return {
-        "schema_version": "deck-semantic-evaluation-1.0",
+        "schema_version": DECK_SEMANTIC_SCHEMA_VERSION,
         "scores": {
-            key: {
+            key: ({
                 "score": score,
                 "confidence": 0.9,
                 "evidence_slides": [1],
                 "explanation": f"Evidence supports {key}.",
                 "missing_evidence": [],
-            }
+                "subcriteria": [
+                    {
+                        "id": subcriterion,
+                        "score": score,
+                        "confidence": 0.9,
+                        "evidence_slides": [1],
+                        "explanation": f"Evidence supports {subcriterion}.",
+                        "missing_evidence": [],
+                    }
+                    for subcriterion in (("r1", "r2") if key == "problem_statement_alignment" else fixed_ids.get(key, ()))
+                ],
+            } if key != "prototype_evidence" else {
+                "score": 50 if score else 0,
+                "confidence": 0.9,
+                "evidence_slides": [1],
+                "explanation": "A partially implemented workflow is shown.",
+                "missing_evidence": [],
+            })
             for key in SEMANTIC_COMPONENTS
+        },
+        "quality_penalty": {
+            "points": 0,
+            "reason": "No distinct deck-wide quality issue was observed.",
+            "evidence_slides": [],
+            "non_overlap_reason": "No additional issue beyond the component scores was observed.",
         },
     }
 
@@ -210,6 +241,74 @@ def test_problem_statement_weights_are_normalized() -> None:
     assert problem.requirements[0]["weight"] > problem.requirements[1]["weight"]
 
 
+def test_revised_rubric_uses_requested_points_and_removes_impact() -> None:
+    assert PROPOSAL_COMPONENT_POINTS == {
+        "problem_statement_alignment": 20.0,
+        "solution_clarity": 20.0,
+        "technical_feasibility": 15.0,
+        "innovation": 10.0,
+        "prototype_evidence": 5.0,
+    }
+    assert DECK_COMPONENT_POINTS == {
+        "text_visual_balance": 8.0,
+        "content_structure": 5.0,
+        "readability": 5.0,
+        "narrative_flow": 4.0,
+        "visual_relevance_coherence": 5.0,
+        "layout_space_usage": 3.0,
+    }
+    assert sum(PROPOSAL_COMPONENT_POINTS.values()) == 70.0
+    assert sum(DECK_COMPONENT_POINTS.values()) == 30.0
+    assert "impact" not in SEMANTIC_COMPONENTS
+
+
+def test_requirement_alignment_is_calculated_from_requirement_subcriteria(tmp_path: Path) -> None:
+    source = tmp_path / "alignment.pptx"
+    _feature_package(source)
+    report = extract_pptx(source)
+
+    class Adapter:
+        name = "mock"
+        version = "mock-1"
+
+        def analyze(self, prompt: str, images: list[Any], timeout: float) -> dict[str, Any]:
+            response = _semantic_response()
+            response["scores"]["problem_statement_alignment"]["subcriteria"][0]["score"] = 20
+            response["scores"]["problem_statement_alignment"]["subcriteria"][1]["score"] = 100
+            return response
+
+    result = evaluate_deck(report, PROBLEM, semantic_adapter=Adapter(), semantic_cache_dir=tmp_path / "cache")
+    alignment = result["scores"]["proposal_strength"]["components"]["problem_statement_alignment"]
+
+    assert alignment["score"] == round((20 * (2 / 3)) + (100 * (1 / 3)), 6)
+
+
+def test_text_visual_balance_penalizes_both_extremes(tmp_path: Path) -> None:
+    source = tmp_path / "balance.pptx"
+    _feature_package(source)
+    report = extract_pptx(source)
+    base = report.to_evaluator_dict()
+
+    def score(text: str, text_density: float, visual_area: float) -> float:
+        payload = json.loads(json.dumps(base))
+        slide = payload["slides"][0]
+        slide["slide_type"] = "process"
+        slide["title"] = {"object_id": "title", "text": "Workflow"}
+        slide["text_blocks"] = [
+            {"object_id": "title", "text": "Workflow", "bbox": [0.1, 0.05, 0.8, 0.1]},
+            {"object_id": "body", "text": text, "bbox": [0.1, 0.2, 0.5, 0.3]},
+        ] if text else [{"object_id": "title", "text": "Workflow", "bbox": [0.1, 0.05, 0.8, 0.1]}]
+        slide["metrics"].update({"text_density": text_density, "visual_area_ratio": visual_area})
+        return evaluate_deck(payload, deck_only=True)["scores"]["deck_quality"]["components"]["text_visual_balance"]["score"]
+
+    balanced = score("Use the workflow to identify and resolve the threat.", 0.25, 0.25)
+    text_heavy = score("This is a very long explanation. " * 30, 0.80, 0.0)
+    visual_heavy = score("", 0.05, 0.90)
+
+    assert balanced > text_heavy
+    assert balanced > visual_heavy
+
+
 def test_deck_evaluation_aggregates_groups_and_final_score(tmp_path: Path) -> None:
     source = tmp_path / "score.pptx"
     _feature_package(source)
@@ -248,15 +347,62 @@ def test_deck_evaluation_aggregates_groups_and_final_score(tmp_path: Path) -> No
         "largest_empty_region_ratio",
         "space_usage",
     }
-    assert proposal["score"] == 76.0
-    assert result["final_score"] == round(
-        PROPOSAL_STRENGTH_WEIGHT * proposal["score"] + DECK_QUALITY_WEIGHT * deck_quality["score"],
-        6,
-    )
+    assert proposal["score"] == round((80 * 65 + 50 * 5) / 70, 6)
+    assert proposal["points"] == round(proposal["score"] * PROPOSAL_STRENGTH_WEIGHT, 6)
+    assert deck_quality["points"] == round(deck_quality["score"] * DECK_QUALITY_WEIGHT, 6)
+    assert result["final_score"] == round(proposal["points"] + deck_quality["points"], 6)
     assert result["rubric_version"] == RUBRIC_VERSION
     assert len(result["evaluation_fingerprint"]) == 64
     for group in result["scores"].values():
         assert {"score", "confidence", "evidence_slides", "explanation", "missing_evidence"} <= set(group)
+
+
+def test_quality_penalty_is_capped_and_applied_only_to_deck_points(tmp_path: Path) -> None:
+    source = tmp_path / "quality-penalty.pptx"
+    _feature_package(source)
+    report = extract_pptx(source)
+    render_dir = tmp_path / "renders"
+    render_dir.mkdir()
+    (render_dir / "slide-01.png").write_bytes(b"rendered slide")
+
+    class Adapter:
+        name = "mock"
+        version = "mock-1"
+
+        def analyze(self, prompt: str, images: list[Any], timeout: float) -> dict[str, Any]:
+            response = _semantic_response()
+            response["quality_penalty"] = {
+                "points": 2,
+                "reason": "Repeated generic imagery weakens communication.",
+                "evidence_slides": [1],
+                "non_overlap_reason": "The repeated imagery is a deck-wide distraction beyond individual metric scores.",
+            }
+            return response
+
+    result = evaluate_deck(
+        report,
+        PROBLEM,
+        render_dir=render_dir,
+        semantic_adapter=Adapter(),
+        semantic_cache_dir=tmp_path / "cache",
+    )
+
+    assert result["semantic"]["rendered_evidence_complete"] is True
+    assert result["quality_penalty"]["points"] == 2
+    assert result["scores"]["deck_quality"]["scoring_source"] == "semantic_rendered"
+    assert result["scores"]["deck_quality"]["points_before_penalty"] == 24.0
+    assert result["scores"]["deck_quality"]["points"] == 22.0
+    assert result["final_score"] == round(result["scores"]["proposal_strength"]["points"] + 22.0, 6)
+
+
+def test_semantic_quality_penalty_rejects_values_above_four() -> None:
+    response = _semantic_response()
+    response["quality_penalty"]["points"] = 5
+
+    valid, error = validate_semantic_payload(response, [1])
+
+    assert not valid
+    assert "0 to 4" in error
 
 
 def test_missing_evidence_penalizes_component_and_weighted_scores(tmp_path: Path) -> None:
@@ -280,15 +426,11 @@ def test_missing_evidence_penalizes_component_and_weighted_scores(tmp_path: Path
     result = evaluate_deck(report, PROBLEM, semantic_adapter=Adapter(), semantic_cache_dir=tmp_path / "cache")
     alignment = result["scores"]["proposal_strength"]["components"]["problem_statement_alignment"]
 
-    assert alignment["unpenalized_score"] == 85.0
-    assert alignment["missing_evidence_penalty"] == 50.0
-    assert alignment["score"] == 35.0
-    assert result["scores"]["proposal_strength"]["missing_evidence_penalty"] == 15.0
-    assert result["scores"]["proposal_strength"]["score"] == 62.5
-    assert any(
-        item["category"] == "explanation_completeness"
-        for item in result["findings"]["weaknesses"]
-    )
+    assert alignment["score"] == 80.0
+    assert alignment["missing_evidence"] == ["missing integration proof", "missing standards proof"]
+    assert "missing_evidence_penalty" not in alignment
+    assert "missing_evidence_penalty" not in result["scores"]["proposal_strength"]
+    assert any(item["category"] == "problem_statement_alignment" for item in result["findings"]["weaknesses"])
 
     custom = evaluate_deck(
         report,
@@ -298,9 +440,9 @@ def test_missing_evidence_penalizes_component_and_weighted_scores(tmp_path: Path
         missing_evidence_penalty=5.0,
     )
     custom_alignment = custom["scores"]["proposal_strength"]["components"]["problem_statement_alignment"]
-    assert custom["missing_evidence_penalty_per_item"] == 5.0
-    assert custom_alignment["missing_evidence_penalty"] == 10.0
-    assert custom_alignment["score"] == 75.0
+    assert custom["missing_evidence_penalty_per_item"] == 0.0
+    assert "missing_evidence_penalty" not in custom_alignment
+    assert custom_alignment["score"] == 80.0
 
 
 def test_content_visual_and_space_rubric_signals_produce_findings(tmp_path: Path) -> None:
@@ -453,7 +595,7 @@ def test_fresh_semantic_bypasses_cache_for_a_new_model_score(tmp_path: Path) -> 
     assert adapter.calls == 2
     assert first["semantic"]["cache_hit"] is False
     assert second["semantic"]["cache_hit"] is False
-    assert first["semantic"]["scores"]["impact"]["score"] != second["semantic"]["scores"]["impact"]["score"]
+    assert first["semantic"]["scores"]["solution_clarity"]["score"] != second["semantic"]["scores"]["solution_clarity"]["score"]
     assert first["evaluation_fingerprint"] != second["evaluation_fingerprint"]
 
 
@@ -497,6 +639,6 @@ def test_evaluate_deck_cli_loads_canonical_deckir(capsys: Any, tmp_path: Path) -
     assert evaluate_cli_main(["--deck-ir", str(deck_path), "--deck-only"]) == 0
     output = json.loads(capsys.readouterr().out)
 
-    assert output["schema_version"] == "deck-evaluation-1.0"
+    assert output["schema_version"] == "deck-evaluation-2.0"
     assert output["scores"]["deck_quality"]["score"] is not None
     assert output["scores"]["proposal_strength"]["score"] is None

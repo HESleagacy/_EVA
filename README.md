@@ -468,6 +468,62 @@ authoritative export boundary.
 
 ### Evaluate Deck
 
+The current rubric is `deck-rubric-2.0`. It produces one score out of 100:
+
+```text
+Final score = proposal strength (70 points) + deck quality (30 points)
+```
+
+Proposal strength is scored as:
+
+| Criterion | Points |
+| --- | ---: |
+| Problem-statement alignment | 20 |
+| Solution clarity | 20 |
+| Technical feasibility and buildability | 15 |
+| Uniqueness of the solution | 10 |
+| Prototype/implementation evidence | 5 |
+
+Deck quality is scored as:
+
+| Criterion | Points |
+| --- | ---: |
+| Text-visual balance | 8 |
+| Concise, structured content | 5 |
+| Readability | 5 |
+| Problem-to-conclusion narrative flow | 4 |
+| Visual relevance and coherence | 5 |
+| Layout and purposeful space usage | 3 |
+
+Alignment is evaluated requirement by requirement using the normalized PS
+weights. Solution clarity and feasibility use fixed subcriteria. Scores use
+anchored bands: `0-20` absent/contradicted, `21-40` assertion-only, `41-60`
+partial, `61-80` concrete and supported, and `81-100` unusually complete and
+well supported. The evaluator uses the full scale to separate materially
+different evidence, but does not manufacture gaps between comparable teams.
+
+Deck quality is deterministic when no rendered images are available. Text walls
+and visual-heavy slides without labels or explanation reduce the balance score;
+there is no mandatory 50:50 text-to-visual area split. Intentional whitespace and
+text-only slides can score well when appropriate for their purpose.
+
+The semantic subcriteria are: solution clarity `mechanism/user_workflow/inputs_outputs/scope`
+(`40/30/20/10`), feasibility `architecture/implementation_plan/resources_dependencies/risks_mitigations`
+(`35/25/25/15`), uniqueness `differentiation/problem_specific_value/justification`
+(`40/40/20`), balance `purpose_fit/complementarity/information_load`
+(`40/35/25`), content structure `clear_concise_writing/organization/precision`
+(`50/30/20`), readability `legibility/contrast/hierarchy/unobstructed_content`
+(`40/25/20/15`), flow `logical_progression/connections/pacing` (`40/35/25`),
+visual coherence `relevance/semantic_coherence/consistent_labels` (`50/30/20`),
+and layout `alignment_grouping/purposeful_space/consistency` (`40/35/25`).
+
+The optional rendered semantic review can apply an additional `0-4` point
+deduction to the deck portion for repeated, observable presentation slop such
+as generic filler, irrelevant decorative imagery, garbled labels, or a visibly
+incoherent visual language. It never infers AI authorship, and AI-assisted
+content is judged for its proposal substance under proposal strength. Color
+variety alone is not a deduction.
+
 Run deterministic deck-quality scoring without external network calls:
 
 ```bash
@@ -478,9 +534,9 @@ evaluate-deck \
   --output evidence/input/evaluation.json
 ```
 
-Missing evidence has a high default penalty of 25 points per distinct item.
-Override it explicitly with `--missing-evidence-penalty` when a rubric requires
-a different policy.
+Missing evidence is scored inside the affected criterion. There is no blanket
+per-item deduction; `--missing-evidence-penalty` remains only as a deprecated
+compatibility option.
 
 For a structural-only run when no problem statement exists:
 
@@ -516,8 +572,9 @@ evaluate-deck \
 
 `--render-dir` accepts raster slide images such as PNG or JPEG. Aurochs writes
 SVG evidence; provide rasterized slide images separately if Gemini should use
-rendered pixels. No model score is inferred when the request, response schema,
-or supporting evidence is unavailable.
+rendered pixels. Proposal scores require a validated semantic response. Deck
+quality falls back to deterministic geometry/content scoring when semantic or
+rendered evidence is unavailable; no unobserved visual polish is awarded.
 
 ### Local Sequential Workflow
 
@@ -594,11 +651,11 @@ The output directory contains only Markdown files: one `report.md` per
 submission and one `ranking.md` grouped by PS. Intermediate DeckIR, evidence,
 and cache data are kept outside the output directory.
 
-When semantic evaluation is available, each submission report also contains an
-evidence-grounded reviewer assessment with five area ratings, strengths, risks,
-limitations, a decision, and the next evidence requested. Linked repositories
-and external PS pages are not browsed; missing evidence is reported and
-penalized rather than guessed.
+Each submission report is a concise scorecard: final points, one row per rubric
+criterion, a short evidence basis, up to three strengths, up to three main
+deductions, and a one-sentence verdict. Linked repositories and external PS
+pages are not browsed. Missing evidence is reported inside the affected
+criterion rather than guessed or blanket-penalized.
 
 ### Output Layout
 
@@ -814,7 +871,8 @@ scoring payload.
 ## Deck Evaluation
 
 The rubric evaluator consumes canonical DeckIR JSON and produces deterministic
-deck-quality metrics plus optional semantic proposal scores:
+deck-quality metrics plus optional semantic proposal scores. The active rubric
+is `deck-rubric-2.0`:
 
 ```bash
 evaluate-deck \
@@ -853,30 +911,27 @@ made.
 
 The output records `title_coverage`, `text_density`, `small_text_ratio`,
 `overlap_ratio`, `clipping_rate`, `content_density_variation`,
-`slide_type_coverage`, `evidence_visibility`, duplicate-content ratio, and
-link/prototype evidence. It also measures `paragraph_content_ratio`,
-`pointer_content_ratio`, `paragraph_heavy_slide_ratio`,
+`paragraph_content_ratio`, `paragraph_heavy_slide_ratio`,
 `ambiguous_claim_ratio`, `visual_coverage`, `whitespace_area_ratio`,
-`largest_empty_region_ratio`, and `space_usage`. Long paragraph-like blocks
-are scored separately from concise pointer-like blocks, and meaningful visual
-area is used instead of raw image counts so decorative assets cannot satisfy
-the visual criterion. Excess whitespace above 35% or a single empty region
-above 20% reduces `space_usage`.
+`largest_empty_region_ratio`, `space_usage`, `generic_filler_ratio`,
+`text_visual_balance`, `narrative_flow`, and
+`visual_relevance_coherence`. The detailed measurements remain diagnostic;
+the six deck-quality criteria are `text_visual_balance` (8 points),
+`content_structure` (5), `readability` (5), `narrative_flow` (4),
+`visual_relevance_coherence` (5), and `layout_space_usage` (3).
 
-The final score is available only when both weighted groups have scores:
+The final score is:
 
-`final_score = 0.70 * proposal_strength + 0.30 * deck_quality`.
+`final_score = proposal points (out of 70) + deck points (out of 30) - optional quality penalty`.
 
-Each distinct missing-evidence item applies a 25-point penalty to its scored
-component. Weighted groups expose the original score and total penalty in
-`unpenalized_score` and `missing_evidence_penalty`.
-
-Every evaluation also contains a `findings` dictionary with `strengths`,
-`weaknesses`, and `ambiguous_points`. Findings cite slide numbers and the
-metric or semantic component that produced them. Missing semantic evidence is
-reported as an incomplete explanation and receives the existing component
-penalty; unresolved semantic evaluation is reported as ambiguous rather than
-being guessed.
+Missing evidence is scored inside the affected criterion. There is no blanket
+25-point deduction per missing-evidence string. A rendered semantic response
+may provide refined deck-quality judgments; otherwise deterministic geometry
+and content scores are used. A separate quality penalty is capped at 4 deck
+points and requires cited, observable communication problems. The evaluator
+never infers AI authorship or treats color variety alone as evidence of poor
+work. Findings cite slide numbers and are kept short for the final Markdown
+scorecard.
 
 ## Semantic Output
 

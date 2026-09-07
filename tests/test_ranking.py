@@ -60,7 +60,7 @@ def test_bucket_thresholds_and_rank_order_are_deterministic() -> None:
     ]
 
 
-def test_final_reports_are_narrative_only() -> None:
+def test_final_reports_are_concise_scorecards() -> None:
     result = SubmissionResult(
         Path("submission.pdf"),
         "team-submission",
@@ -82,13 +82,14 @@ def test_final_reports_are_narrative_only() -> None:
 
     report = render_evaluation_markdown(result)
 
+    assert "## Scorecard" in report
+    assert "## Verdict" in report
     assert "## Overall Result" not in report
-    assert "## Component Scores" not in report
     assert "Clear approach" in report
     assert "Native objects" in report
 
 
-def test_final_reports_render_reviewer_critique_when_available() -> None:
+def test_final_reports_do_not_replace_authoritative_scorecard_with_reviewer_critique() -> None:
     result = SubmissionResult(
         Path("submission.pdf"),
         "team-submission",
@@ -125,10 +126,10 @@ def test_final_reports_render_reviewer_critique_when_available() -> None:
 
     report = render_evaluation_markdown(result)
 
-    assert "## Area Review" in report
-    assert "## What Prevents a Higher Score" in report
-    assert "## Judging Decision" in report
-    assert "External links were not inspected." in report
+    assert "## Scorecard" in report
+    assert "## Verdict" in report
+    assert "## Area Review" not in report
+    assert "## What Prevents a Higher Score" not in report
 
 
 def test_ranking_report_groups_problem_statements() -> None:

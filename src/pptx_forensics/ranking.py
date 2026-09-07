@@ -14,7 +14,9 @@ import urllib.parse
 import urllib.request
 
 from .deck_evaluation import (
+    DECK_COMPONENT_POINTS,
     MISSING_EVIDENCE_PENALTY,
+    PROPOSAL_COMPONENT_POINTS,
     ProblemStatement,
     ProblemStatementError,
     evaluate_deck,
@@ -253,7 +255,7 @@ def assign_ranks(results: Sequence[SubmissionResult], thresholds: BucketThreshol
 
 
 def render_evaluation_markdown(result: SubmissionResult) -> str:
-    """Render the narrative-only final report for one submission."""
+    """Render a concise, evidence-backed scorecard for one submission."""
     lines = [
         "# Deck Evaluation Report",
         "",
@@ -273,18 +275,34 @@ def render_evaluation_markdown(result: SubmissionResult) -> str:
         lines.extend(["## Processing Status", "", f"- Error: {_one_line(result.error)}", ""])
         return "\n".join(lines)
 
-    findings = result.evaluation.get("findings", {}) if result.evaluation else {}
+    evaluation = result.evaluation or {}
+    scores = evaluation.get("scores") if isinstance(evaluation, Mapping) else None
+    lines.extend(_scorecard_sections(evaluation, scores if isinstance(scores, Mapping) else {}))
+
+    findings = evaluation.get("findings", {}) if isinstance(evaluation, Mapping) else {}
     if not isinstance(findings, Mapping):
         findings = {}
-    review = result.evaluation.get("review") if result.evaluation else None
-    if not isinstance(review, Mapping) and result.evaluation:
-        semantic = result.evaluation.get("semantic")
-        review = semantic.get("review") if isinstance(semantic, Mapping) else None
-    if isinstance(review, Mapping):
-        lines.extend(_review_sections(review))
-    else:
-        lines.extend(_finding_section("Strengths", findings.get("strengths", [])))
-        lines.extend(_finding_section("Improvement Signals", [*findings.get("weaknesses", []), *findings.get("ambiguous_points", [])]))
+    lines.extend(_finding_section("Top Strengths", findings.get("strengths", []), limit=3))
+    lines.extend(
+        _finding_section(
+            "Main Deductions",
+            [*findings.get("weaknesses", []), *findings.get("ambiguous_points", [])],
+            limit=3,
+        )
+    )
+    if isinstance(evaluation, Mapping):
+        quality_penalty = evaluation.get("quality_penalty")
+        if isinstance(quality_penalty, Mapping):
+            lines.extend(
+                [
+                    "## Additional Quality Penalty",
+                    "",
+                    f"- Points: `{_display_number(quality_penalty.get('points'), '0')}`",
+                    f"- Basis: {_one_line(quality_penalty.get('reason', 'Not assessed.'))}",
+                    "",
+                ]
+            )
+        lines.extend(_verdict_section(result, evaluation, findings))
     lines.extend(["## Evidence Coverage", ""])
     for label, value in (result.evidence or {}).items():
         lines.append(f"- {label}: `{value}`")
@@ -292,6 +310,70 @@ def render_evaluation_markdown(result: SubmissionResult) -> str:
         lines.append("- No evidence summary was produced.")
     lines.append("")
     return "\n".join(lines)
+
+
+def _scorecard_sections(evaluation: Mapping[str, Any], scores: Mapping[str, Any]) -> list[str]:
+    lines = ["## Scorecard", ""]
+    final = scores.get("final") if isinstance(scores.get("final"), Mapping) else {}
+    proposal = scores.get("proposal_strength") if isinstance(scores.get("proposal_strength"), Mapping) else {}
+    deck = scores.get("deck_quality") if isinstance(scores.get("deck_quality"), Mapping) else {}
+    final_score = _finite_value(final.get("score"))
+    proposal_points = _finite_value(proposal.get("points"))
+    deck_points = _finite_value(deck.get("points"))
+    if final_score is None:
+        lines.append("- Final score: `REVIEW` (a complete weighted score was not available)")
+    else:
+        lines.append(
+            f"- Final score: `{final_score:.2f}/100` "
+            f"(proposal `{proposal_points:.2f}/70` + deck `{deck_points:.2f}/30`)"
+        )
+    lines.append("")
+    lines.extend(["| Metric | Score | Points | Basis |", "| --- | ---: | ---: | --- |"])
+    point_maps = (
+        (proposal, PROPOSAL_COMPONENT_POINTS),
+        (deck, DECK_COMPONENT_POINTS),
+    )
+    for group, point_map in point_maps:
+        components = group.get("components") if isinstance(group.get("components"), Mapping) else {}
+        for key, maximum in point_map.items():
+            record = components.get(key) if isinstance(components.get(key), Mapping) else {}
+            score = _finite_value(record.get("score"))
+            points = score * maximum / 100.0 if score is not None else None
+            basis = record.get("explanation") or "Not assessed."
+            lines.append(
+                f"| {_table_text(key.replace('_', ' ').capitalize())} | "
+                f"{_display_number(score, 'REVIEW')}/100 | {_display_number(points, 'N/A')}/{maximum:g} | "
+                f"{_table_text(_brief(basis))} |"
+            )
+    penalty = evaluation.get("quality_penalty")
+    if isinstance(penalty, Mapping):
+        penalty_points = _finite_value(penalty.get("points"))
+        if penalty_points:
+            lines.append(f"| Additional deck-quality penalty | - | -{penalty_points:g} | {_table_text(_brief(penalty.get('reason', '')))} |")
+    lines.append("")
+    return lines
+
+
+def _verdict_section(
+    result: SubmissionResult,
+    evaluation: Mapping[str, Any],
+    findings: Mapping[str, Any],
+) -> list[str]:
+    final = evaluation.get("scores", {}).get("final", {}) if isinstance(evaluation.get("scores"), Mapping) else {}
+    score = _finite_value(final.get("score")) if isinstance(final, Mapping) else None
+    deductions = [
+        item
+        for item in [*findings.get("weaknesses", []), *findings.get("ambiguous_points", [])]
+        if isinstance(item, Mapping)
+    ]
+    if score is None:
+        sentence = "The submission remains in REVIEW because a complete numeric score was unavailable."
+    elif deductions:
+        first = _one_line(deductions[0].get("detail", ""))
+        sentence = f"The submission scored {score:.2f}/100; the main limiting factor is {first}."
+    else:
+        sentence = f"The submission scored {score:.2f}/100 with no material deduction identified in the supplied evidence."
+    return ["## Verdict", "", f"- {sentence}", ""]
 
 
 def render_ranking_markdown(results: Sequence[SubmissionResult]) -> str:
@@ -602,7 +684,7 @@ def _process_submission(
             proposal_score = _score(evaluation, ("scores", "proposal_strength", "score"))
             deck_quality_score = _score(evaluation, ("scores", "deck_quality", "score"))
             evidence = _evidence_summary(report, evaluation)
-            evidence["Missing-evidence policy"] = f"{missing_evidence_penalty:g} points per distinct item"
+            evidence["Missing-evidence policy"] = "Criterion-scoped; no blanket per-item deduction"
             digest = report.source_sha256[:8]
             submission_id = f"{safe_slug(team)}-{digest}" if team_override else f"{safe_slug(team)}-{safe_slug(source.stem)}-{digest}"
             return SubmissionResult(
@@ -739,12 +821,13 @@ def _evidence_summary(report: Any, evaluation: Mapping[str, Any]) -> dict[str, A
     return evidence_dict
 
 
-def _finding_section(title: str, findings: Any) -> list[str]:
+def _finding_section(title: str, findings: Any, *, limit: int | None = None) -> list[str]:
     lines = [f"## {title}", ""]
     if not isinstance(findings, list) or not findings:
         lines.append("- None reported.")
         lines.append("")
         return lines
+    rendered = 0
     for finding in findings:
         if not isinstance(finding, Mapping):
             continue
@@ -753,6 +836,9 @@ def _finding_section(title: str, findings: Any) -> list[str]:
         evidence = finding.get("evidence_slides")
         suffix = f"; slides: {', '.join(str(item) for item in evidence)}" if isinstance(evidence, list) and evidence else ""
         lines.append(f"- **{label}**: {detail}{suffix}")
+        rendered += 1
+        if limit is not None and rendered >= limit:
+            break
     lines.append("")
     return lines
 
@@ -820,6 +906,11 @@ def _one_line(value: Any) -> str:
     return " ".join(str(value or "").split()).replace("|", "\\|")
 
 
+def _brief(value: Any, limit: int = 180) -> str:
+    text = _one_line(value)
+    return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
+
+
 def _table_text(value: Any) -> str:
     return _one_line(value)
 
@@ -830,3 +921,12 @@ def _finite_number(value: Any) -> bool:
     except (TypeError, ValueError):
         return False
     return number == number and abs(number) != float("inf")
+
+
+def _finite_value(value: Any) -> float | None:
+    return float(value) if _finite_number(value) else None
+
+
+def _display_number(value: Any, fallback: str) -> str:
+    number = _finite_value(value)
+    return f"{number:.2f}" if number is not None else fallback

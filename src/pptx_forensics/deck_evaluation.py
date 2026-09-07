@@ -27,21 +27,30 @@ from .models import DeckIR
 from .vision import VisionImage
 
 
-EVALUATION_SCHEMA_VERSION = "deck-evaluation-1.0"
-RUBRIC_VERSION = "deck-rubric-1.1"
-SEMANTIC_SCHEMA_VERSION = "deck-semantic-evaluation-1.0"
+EVALUATION_SCHEMA_VERSION = "deck-evaluation-2.0"
+RUBRIC_VERSION = "deck-rubric-2.0"
+SEMANTIC_SCHEMA_VERSION = "deck-semantic-evaluation-2.0"
+# ``output.SEMANTIC_SCHEMA_VERSION`` is the document-semantic schema. Expose a
+# distinct name so callers can validate rubric responses without ambiguity.
+DECK_SEMANTIC_SCHEMA_VERSION = SEMANTIC_SCHEMA_VERSION
 SEMANTIC_MODEL = "gemini-2.5-flash"
 SCORE_SCALE = 100.0
 PROPOSAL_STRENGTH_WEIGHT = 0.70
 DECK_QUALITY_WEIGHT = 0.30
-MISSING_EVIDENCE_PENALTY = 25.0
+MISSING_EVIDENCE_PENALTY = 0.0
 
 SEMANTIC_COMPONENTS = (
     "problem_statement_alignment",
     "solution_clarity",
     "technical_feasibility",
     "innovation",
-    "impact",
+    "prototype_evidence",
+    "text_visual_balance",
+    "content_structure",
+    "readability",
+    "narrative_flow",
+    "visual_relevance_coherence",
+    "layout_space_usage",
 )
 REVIEW_AREAS = (
     "fit_to_problem",
@@ -52,23 +61,49 @@ REVIEW_AREAS = (
 )
 REVIEW_DECISIONS = ("advance_to_demo", "needs_revision", "do_not_advance")
 PROPOSAL_COMPONENT_WEIGHTS = {
-    "problem_statement_alignment": 0.30,
-    "solution_clarity": 0.20,
-    "technical_feasibility": 0.20,
-    "innovation": 0.15,
-    "impact": 0.10,
-    "prototype_evidence": 0.05,
+    "problem_statement_alignment": 20 / 70,
+    "solution_clarity": 20 / 70,
+    "technical_feasibility": 15 / 70,
+    "innovation": 10 / 70,
+    "prototype_evidence": 5 / 70,
+}
+PROPOSAL_COMPONENT_POINTS = {
+    "problem_statement_alignment": 20.0,
+    "solution_clarity": 20.0,
+    "technical_feasibility": 15.0,
+    "innovation": 10.0,
+    "prototype_evidence": 5.0,
 }
 DECK_COMPONENT_WEIGHTS = {
-    "readability": 0.20,
-    "layout_consistency": 0.15,
-    "visual_hierarchy": 0.15,
-    "evidence_visibility": 0.10,
-    "content_originality": 0.10,
-    "content_structure": 0.10,
-    "visual_coverage": 0.10,
-    "space_usage": 0.10,
+    "text_visual_balance": 8 / 30,
+    "content_structure": 5 / 30,
+    "readability": 5 / 30,
+    "narrative_flow": 4 / 30,
+    "visual_relevance_coherence": 5 / 30,
+    "layout_space_usage": 3 / 30,
 }
+DECK_COMPONENT_POINTS = {
+    "text_visual_balance": 8.0,
+    "content_structure": 5.0,
+    "readability": 5.0,
+    "narrative_flow": 4.0,
+    "visual_relevance_coherence": 5.0,
+    "layout_space_usage": 3.0,
+}
+SUBCRITERION_WEIGHTS = {
+    "solution_clarity": {"mechanism": .40, "user_workflow": .30, "inputs_outputs": .20, "scope": .10},
+    "technical_feasibility": {"architecture": .35, "implementation_plan": .25, "resources_dependencies": .25, "risks_mitigations": .15},
+    "innovation": {"differentiation": .40, "problem_specific_value": .40, "justification": .20},
+    "text_visual_balance": {"purpose_fit": .40, "complementarity": .35, "information_load": .25},
+    "content_structure": {"clear_concise_writing": .50, "organization": .30, "precision": .20},
+    "readability": {"legibility": .40, "contrast": .25, "hierarchy": .20, "unobstructed_content": .15},
+    "narrative_flow": {"logical_progression": .40, "connections": .35, "pacing": .25},
+    "visual_relevance_coherence": {"relevance": .50, "semantic_coherence": .30, "consistent_labels": .20},
+    "layout_space_usage": {"alignment_grouping": .40, "purposeful_space": .35, "consistency": .25},
+}
+VISUAL_COMPONENTS = {"text_visual_balance", "readability", "visual_relevance_coherence", "layout_space_usage"}
+PROPOSAL_COMPONENTS = frozenset(PROPOSAL_COMPONENT_WEIGHTS)
+DECK_COMPONENTS = frozenset(DECK_COMPONENT_WEIGHTS)
 PROTOTYPE_TERMS = (
     "demo",
     "prototype",
@@ -116,6 +151,24 @@ AMBIGUOUS_TERMS = (
     "scalable",
     "secure",
     "seamless",
+)
+GENERIC_FILLER_TERMS = (
+    "innovative solution",
+    "cutting edge",
+    "cutting-edge",
+    "game changer",
+    "game-changing",
+    "revolutionary",
+    "seamless experience",
+    "unlock the potential",
+    "leverage the power",
+    "transform the way",
+    "next generation",
+    "user friendly",
+    "user-friendly",
+    "end to end",
+    "end-to-end",
+    "powered by ai",
 )
 _WORD_PATTERN = re.compile(r"[A-Za-z0-9]+(?:['’/-][A-Za-z0-9]+)*")
 _URL_PATTERN = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
@@ -281,7 +334,7 @@ def _validate_requirement(item: Any, index: int) -> dict[str, Any]:
 def validate_problem_statement(value: Any) -> ProblemStatement:
     """Validate and normalize a weighted problem statement."""
     if isinstance(value, ProblemStatement):
-        return value
+        value = value.to_dict()
     if not isinstance(value, Mapping):
         raise ProblemStatementError("problem statement must be a JSON object")
     identifier = _text(value.get("id"))
@@ -307,6 +360,8 @@ def validate_problem_statement(value: Any) -> ProblemStatement:
     if not isinstance(raw_requirements, list) or not raw_requirements:
         raise ProblemStatementError("problem statement requires a non-empty requirements list")
     requirements = [_validate_requirement(item, index) for index, item in enumerate(raw_requirements, 1)]
+    if len({item["id"] for item in requirements}) != len(requirements):
+        raise ProblemStatementError("problem statement requirement ids must be unique")
     total_weight = sum(item["weight"] for item in requirements)
     if total_weight <= 0:
         raise ProblemStatementError("problem statement requirement weights must sum to a positive value")
@@ -593,6 +648,286 @@ def _content_structure_metrics(
     return metrics, details
 
 
+def _generic_filler_metrics(
+    slides: Sequence[Mapping[str, Any]],
+) -> tuple[float | None, dict[str, Any]]:
+    """Measure observable generic presentation filler, never presumed authorship."""
+    blocks: list[tuple[int, str]] = []
+    for index, slide in enumerate(slides, 1):
+        number = _slide_number(slide, index)
+        for block in _body_blocks(slide):
+            text = _text(block.get("text"))
+            if text:
+                blocks.append((number, text))
+
+    if not blocks:
+        detail = _metric_detail(
+            None,
+            [],
+            "Generic filler cannot be measured without visible body text.",
+            ["no visible body text"],
+        )
+        return None, detail
+
+    patterns = [re.compile(rf"(?<!\w){re.escape(term)}(?!\w)", re.IGNORECASE) for term in GENERIC_FILLER_TERMS]
+    filler_blocks: list[int] = []
+    matched_terms: dict[str, int] = {}
+    for number, text in blocks:
+        terms = [term for term, pattern in zip(GENERIC_FILLER_TERMS, patterns) if pattern.search(text)]
+        if terms:
+            filler_blocks.append(number)
+            for term in terms:
+                matched_terms[term] = matched_terms.get(term, 0) + 1
+
+    ratio = len(filler_blocks) / len(blocks)
+    value = round(ratio, 6)
+    return value, _metric_detail(
+        value,
+        filler_blocks,
+        "Fraction of visible body-text blocks containing repeated generic filler phrases; this does not infer AI authorship.",
+        [],
+        block_count=len(blocks),
+        filler_block_count=len(filler_blocks),
+        matched_terms={key: matched_terms[key] for key in sorted(matched_terms)},
+    )
+
+
+def _slide_balance_score(slide: Mapping[str, Any], index: int) -> tuple[float, dict[str, Any]]:
+    """Score whether a slide has enough explanation for its visuals and vice versa."""
+    number = _slide_number(slide, index)
+    metrics = slide.get("metrics") if isinstance(slide.get("metrics"), Mapping) else {}
+    text_density = _clamp(metrics.get("text_density"))
+    visual_area = _clamp(metrics.get("visual_area_ratio"))
+    body_characters = sum(len(_text(block.get("text"))) for block in _body_blocks(slide))
+    slide_type = _text(slide.get("slide_type")).casefold()
+    if text_density is None:
+        text_density = 0.0
+    if visual_area is None:
+        visual_area = 0.0
+    visual_label_characters = sum(
+        len(_text(item.get("ocr_text")))
+        for item in slide.get("visual_evidence", [])
+        if isinstance(item, Mapping) and item.get("ocr_text")
+    )
+    explanation_characters = body_characters + visual_label_characters
+
+    # These are soft signals. A title or closing slide is not required to have
+    # the same text/visual mix as an architecture or results slide.
+    text_overload = max(0.0, min(1.0, (text_density - 0.32) / 0.48))
+    if body_characters <= 0:
+        text_overload = 0.0
+    low_text_factor = max(0.0, min(1.0, (90.0 - body_characters) / 90.0))
+    visual_overload = max(0.0, min(1.0, (visual_area - 0.70) / 0.30)) * low_text_factor
+    visual_expected = slide_type in {"architecture", "process", "results", "comparison"}
+    visual_gap = 0.0
+    if (visual_expected or body_characters >= 180) and visual_area < 0.08:
+        visual_gap = min(1.0, (0.08 - visual_area) / 0.08)
+    explanation_gap = 0.0
+    if visual_area >= 0.25 and explanation_characters < 55:
+        explanation_gap = min(1.0, (55.0 - explanation_characters) / 55.0)
+
+    score = max(
+        0.0,
+        min(
+            1.0,
+            1.0
+            - 0.50 * text_overload
+            - 0.25 * visual_overload
+            - 0.15 * visual_gap
+            - 0.10 * explanation_gap,
+        ),
+    )
+    return score, {
+        "text_density": round(text_density, 6),
+        "visual_area_ratio": round(visual_area, 6),
+        "body_character_count": body_characters,
+        "visual_label_character_count": visual_label_characters,
+        "text_overload": round(text_overload, 6),
+        "visual_overload": round(visual_overload, 6),
+        "visual_gap": round(visual_gap, 6),
+        "explanation_gap": round(explanation_gap, 6),
+        "score": round(score, 6),
+        "slide_number": number,
+    }
+
+
+def _text_visual_balance(
+    slides: Sequence[Mapping[str, Any]],
+) -> tuple[float | None, dict[str, Any]]:
+    if not slides:
+        return None, _metric_detail(None, [], "Text-visual balance cannot be measured without slides.", ["no slides"])
+    values: dict[str, float] = {}
+    slide_values: dict[str, dict[str, Any]] = {}
+    for index, slide in enumerate(slides, 1):
+        score, detail = _slide_balance_score(slide, index)
+        number = _slide_number(slide, index)
+        values[str(number)] = round(score, 6)
+        slide_values[str(number)] = detail
+    value = round(mean(values.values()), 6)
+    low_slides = [int(number) for number, score in values.items() if score < 0.60]
+    return value, _metric_detail(
+        value,
+        [int(number) for number in values],
+        "Text-visual balance softly penalizes text overload, unexplained visual-heavy slides, and missing visuals where the slide purpose calls for them.",
+        [f"text-visual balance is weak on slide {number}" for number in low_slides],
+        slide_values=slide_values,
+    )
+
+
+def _phase_for_slide(text: str, index: int, total: int) -> str | None:
+    value = text.casefold()
+    phase_terms = (
+        ("problem", ("problem", "challenge", "pain point", "need", "objective", "requirement")),
+        ("solution", ("solution", "approach", "proposed", "how it works", "workflow", "process")),
+        ("build", ("architecture", "system design", "implementation", "technology", "tech stack", "model")),
+        ("evidence", ("prototype", "demo", "result", "evaluation", "validation", "testing", "benchmark", "metric")),
+        ("close", ("conclusion", "summary", "next step", "roadmap", "future work", "thank you")),
+    )
+    for phase, terms in phase_terms:
+        if any(term in value for term in terms):
+            return phase
+    # A short deck may have an unlabeled opening or closing slide. Do not
+    # invent a semantic phase for interior slides from their position alone.
+    if index == 1 and total > 1 and value:
+        return "problem"
+    if index == total and total > 1 and value:
+        return "close"
+    return None
+
+
+def _narrative_flow(slides: Sequence[Mapping[str, Any]]) -> tuple[float | None, dict[str, Any]]:
+    if not slides:
+        return None, _metric_detail(None, [], "Narrative flow cannot be measured without slides.", ["no slides"])
+    phases: list[tuple[str, int]] = []
+    for index, slide in enumerate(slides, 1):
+        number = _slide_number(slide, index)
+        title = slide.get("title") if isinstance(slide.get("title"), Mapping) else {}
+        text = " ".join(
+            part
+            for part in (
+                _text(title.get("text")),
+                _text(slide.get("visible_text")),
+            )
+            if part
+        )
+        phase = _phase_for_slide(text, index, len(slides))
+        if phase:
+            phases.append((phase, number))
+
+    first_by_phase: dict[str, int] = {}
+    for phase, number in phases:
+        first_by_phase.setdefault(phase, number)
+    desired = ("problem", "solution", "build", "evidence", "close")
+    present = [phase for phase in desired if phase in first_by_phase]
+    coverage = len(present) / len(desired)
+    order_pairs = sum(
+        first_by_phase[present[index]] <= first_by_phase[present[index + 1]]
+        for index in range(len(present) - 1)
+    )
+    order = order_pairs / max(1, len(present) - 1)
+    opening = 1.0 if "problem" in first_by_phase else 0.0
+    closing = 1.0 if "close" in first_by_phase else 0.0
+    # A flow connector is useful supporting evidence, but it cannot replace a
+    # missing problem-to-solution narrative.
+    flow_signal = mean(
+        [
+            1.0 if _text(slide.get("slide_type")).casefold() in {"process", "architecture"} else 0.0
+            for slide in slides
+        ]
+    )
+    score = 100.0 * (0.40 * coverage + 0.30 * order + 0.20 * opening + 0.10 * max(closing, flow_signal))
+    evidence = [number for _, number in phases]
+    return round(score / SCORE_SCALE, 6), _metric_detail(
+        round(score / SCORE_SCALE, 6),
+        evidence or [_slide_number(slide, index) for index, slide in enumerate(slides, 1)],
+        "Narrative flow checks whether the visible sequence moves from the problem through the solution/build evidence toward a conclusion or next step.",
+        [f"narrative phase is not clearly shown: {phase}" for phase in desired if phase not in first_by_phase],
+        phases=[{"phase": phase, "slide": number} for phase, number in phases],
+        phase_first_slides=first_by_phase,
+        phase_coverage=round(coverage, 6),
+        phase_order=round(order, 6),
+    )
+
+
+def _visual_relevance_coherence(
+    slides: Sequence[Mapping[str, Any]],
+) -> tuple[float | None, dict[str, Any]]:
+    if not slides:
+        return None, _metric_detail(None, [], "Visual relevance cannot be measured without slides.", ["no slides"])
+    values: dict[str, float] = {}
+    slide_values: dict[str, dict[str, Any]] = {}
+    all_hashes: list[str] = []
+    for index, slide in enumerate(slides, 1):
+        number = _slide_number(slide, index)
+        visuals = [item for item in slide.get("visual_evidence", []) if isinstance(item, Mapping)]
+        if not visuals:
+            value = 0.35
+            detail = {"visual_count": 0, "relevant_count": 0, "low_confidence_count": 0, "score": value}
+        else:
+            relevant = [item for item in visuals if item.get("role") not in {"unknown", "decorative", "template"}]
+            low_confidence = [item for item in visuals if item.get("content_status") == "low_confidence"]
+            for item in visuals:
+                if item.get("sha256"):
+                    all_hashes.append(str(item["sha256"]))
+            relevance = len(relevant) / len(visuals)
+            confidence = 1.0 - 0.5 * len(low_confidence) / len(visuals)
+            value = max(0.0, min(1.0, 0.75 * relevance + 0.25 * confidence))
+            detail = {
+                "visual_count": len(visuals),
+                "relevant_count": len(relevant),
+                "low_confidence_count": len(low_confidence),
+                "roles": sorted({str(item.get("role")) for item in visuals}),
+                "score": round(value, 6),
+            }
+        values[str(number)] = round(value, 6)
+        slide_values[str(number)] = detail
+
+    duplicate_visual_ratio = 0.0
+    if all_hashes:
+        duplicate_visual_ratio = (len(all_hashes) - len(set(all_hashes))) / len(all_hashes)
+    value = round(mean(values.values()) * (1.0 - 0.15 * duplicate_visual_ratio), 6)
+    return value, _metric_detail(
+        value,
+        [int(number) for number in values],
+        "Visual relevance rewards visuals that are explanatory and confidently classified; it does not infer whether an asset was AI-generated.",
+        [],
+        slide_values=slide_values,
+        duplicate_visual_ratio=round(duplicate_visual_ratio, 6),
+    )
+
+
+def _layout_space_usage(
+    metrics: Mapping[str, Any],
+    details: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    space = _number(metrics.get("space_usage"))
+    variation = _number(metrics.get("content_density_variation"))
+    overlap = _number(metrics.get("overlap_ratio"))
+    required = (space, variation, overlap)
+    if any(value is None for value in required):
+        missing = [
+            label
+            for label, value in zip(("space usage", "content-density variation", "overlap"), required)
+            if value is None
+        ]
+        return _score_record(None, None, [], "Layout and space usage cannot be calculated from complete slide geometry.", missing)
+    consistency = 1.0 - min(1.0, max(0.0, variation) / 0.20)
+    score = 100.0 * (0.60 * max(0.0, min(1.0, space)) + 0.20 * consistency + 0.20 * (1.0 - max(0.0, min(1.0, overlap))))
+    evidence = sorted(
+        {
+            slide
+            for key in ("space_usage", "content_density_variation", "overlap_ratio")
+            for slide in details.get(key, {}).get("evidence_slides", [])
+        }
+    )
+    return _score_record(
+        score,
+        1.0,
+        evidence,
+        "Layout and space usage combines purposeful whitespace (60%), cross-slide density consistency (20%), and unobstructed grouping (20%).",
+    )
+
+
 def _visual_coverage(slides: Sequence[Mapping[str, Any]]) -> tuple[float | None, dict[str, Any]]:
     if not slides:
         return None, _metric_detail(None, [], "Visual coverage cannot be measured without slides.", ["no slides"])
@@ -790,7 +1125,7 @@ def _prototype_evidence(payload: Mapping[str, Any], slides: Sequence[Mapping[str
         if isinstance(image, Mapping) and image.get("role") in evidence_roles and image.get("scoring_relevant") is not False
     ]
     has_evidence = bool(prototype_links or evidence_images)
-    value = 1.0 if has_evidence else 0.0
+    value = None
     slides_with_evidence = [number for number, _ in evidence_images]
     slides_with_evidence.extend(
         int(number)
@@ -802,7 +1137,7 @@ def _prototype_evidence(payload: Mapping[str, Any], slides: Sequence[Mapping[str
     return value, _metric_detail(
         value,
         slides_with_evidence,
-        "Concrete prototype evidence is present when a demo/repository/prototype link or meaningful evidence image is available.",
+        "Candidate links and image roles are inventory only; prototype maturity requires semantic inspection, not link existence.",
         missing,
         external_link_count=len(links),
         prototype_link_count=len(prototype_links),
@@ -884,9 +1219,27 @@ def compute_deterministic_metrics(value: EvaluatorIR | Mapping[str, Any]) -> tup
     metrics["duplicate_content_ratio"] = duplicate_value
     details["duplicate_content"] = duplicate_detail
 
+    filler_value, filler_detail = _generic_filler_metrics(slides)
+    metrics["generic_filler_ratio"] = filler_value
+    details["generic_filler_ratio"] = filler_detail
+
+    balance_value, balance_detail = _text_visual_balance(slides)
+    metrics["text_visual_balance"] = balance_value
+    details["text_visual_balance"] = balance_detail
+
+    flow_value, flow_detail = _narrative_flow(slides)
+    metrics["narrative_flow"] = flow_value
+    details["narrative_flow"] = flow_detail
+
+    visual_relevance_value, visual_relevance_detail = _visual_relevance_coherence(slides)
+    metrics["visual_relevance_coherence"] = visual_relevance_value
+    details["visual_relevance_coherence"] = visual_relevance_detail
+
     prototype_value, prototype_detail = _prototype_evidence(payload, slides)
     metrics["link_prototype_evidence"] = prototype_value
     details["link_prototype_evidence"] = prototype_detail
+    for key in ("visual_coverage", "space_usage", "link_prototype_evidence"):
+        details[key]["scoring_use"] = "diagnostic_only; not a rubric score"
     return metrics, details
 
 
@@ -927,12 +1280,12 @@ def _weighted_group(
         source_missing = _missing(source.get("missing_evidence", []))
         source["missing_evidence"] = source_missing
         missing.extend(source_missing)
-        if source.get("score") is None:
+        if source.get("score") is None and weight > 0:
             unavailable.append(f"{component} score is unavailable")
         elif source.get("confidence") is not None:
             weighted_confidence += weight * float(source["confidence"])
             raw_score = _number(source["score"])
-            penalty = min(raw_score, missing_evidence_penalty * len(source_missing)) if raw_score is not None else 0.0
+            penalty = 0.0  # Rubric 2 scores submission gaps within criteria, never per missing item.
             if penalty:
                 source["unpenalized_score"] = round(raw_score, 6)
                 source["missing_evidence_penalty"] = round(penalty, 6)
@@ -944,7 +1297,7 @@ def _weighted_group(
         confidence = None
         score = None
     else:
-        score = sum(float(components[key]["score"]) * weight for key, weight in weights.items())
+        score = sum(float(components[key]["score"]) * weight for key, weight in weights.items() if weight > 0)
         confidence = weighted_confidence
         group_explanation = explanation
     result = {
@@ -961,21 +1314,55 @@ def _weighted_group(
 def _deterministic_scores(
     metrics: Mapping[str, Any],
     details: Mapping[str, Mapping[str, Any]],
+    slides: Sequence[Mapping[str, Any]],
 ) -> dict[str, dict[str, Any]]:
+    """Produce the offline deck-quality baseline for rubric 2.0.
+
+    These scores intentionally use observable geometry and extracted content.
+    Rendered-image review can replace them for a fully observed deck, but a
+    missing model or renderer must not turn measurable deck quality into a
+    guessed score or an automatic zero.
+    """
+    balance = _metric_score(
+        metrics,
+        details,
+        "text_visual_balance",
+        lambda value: value * SCORE_SCALE,
+        "Text-visual balance considers text overload, visual overload without explanation, and missing visual support for visual slide types.",
+    )
+    structure = _metric_score(
+        metrics,
+        details,
+        "content_structure_score",
+        lambda value: value * SCORE_SCALE,
+        "Content structure rewards concise pointers and deducts for paragraph-heavy blocks and broad unsupported claims.",
+    )
+    filler_ratio = _number(metrics.get("generic_filler_ratio"))
+    if structure.get("score") is not None and filler_ratio is not None:
+        filler_deduction = min(8.0, filler_ratio * 10.0)
+        structure["score"] = round(max(0.0, float(structure["score"]) - filler_deduction), 6)
+        structure["explanation"] = (
+            "Content structure rewards concise pointers and deducts for paragraph-heavy blocks, broad unsupported claims, "
+            f"and observable generic filler ({filler_ratio:.0%} of body blocks)."
+        )
+        structure["generic_filler_deduction"] = round(filler_deduction, 6)
+
     readability = _score_record(
         None,
         None,
         [],
-        "Readability combines title coverage, small-text ratio, overlap, and clipping.",
+        "Readability combines title coverage, inverse small-text ratio, inverse overlap, and inverse clipping.",
         [],
     )
     required = ("title_coverage", "small_text_ratio", "overlap_ratio", "clipping_rate")
-    if all(_number(metrics.get(key)) is not None for key in required):
+    values = [_number(metrics.get(key)) for key in required]
+    if all(value is not None for value in values):
+        title, small_text, overlap, clipping = (float(value) for value in values)
         score = (
-            _number(metrics["title_coverage"]) * 0.35
-            + (1 - _number(metrics["small_text_ratio"])) * 0.25
-            + (1 - _number(metrics["overlap_ratio"])) * 0.20
-            + (1 - _number(metrics["clipping_rate"])) * 0.20
+            title * 0.35
+            + (1.0 - small_text) * 0.25
+            + (1.0 - overlap) * 0.20
+            + (1.0 - clipping) * 0.20
         ) * SCORE_SCALE
         evidence = sorted({slide for key in required for slide in details.get(key, {}).get("evidence_slides", [])})
         missing = [item for key in required for item in details.get(key, {}).get("missing_evidence", [])]
@@ -987,63 +1374,28 @@ def _deterministic_scores(
             missing,
         )
 
-    layout = _score_record(None, None, [], "Layout consistency combines density variation, overlap, and clipping.", [])
-    required = ("content_density_variation", "overlap_ratio", "clipping_rate")
-    if all(_number(metrics.get(key)) is not None for key in required):
-        density_consistency = 1 - min(1.0, _number(metrics["content_density_variation"]) / 0.20)
-        score = (density_consistency * 0.45 + (1 - _number(metrics["overlap_ratio"])) * 0.30 + (1 - _number(metrics["clipping_rate"])) * 0.25) * SCORE_SCALE
-        evidence = sorted({slide for key in required for slide in details.get(key, {}).get("evidence_slides", [])})
-        missing = [item for key in required for item in details.get(key, {}).get("missing_evidence", [])]
-        layout = _score_record(
-            score,
-            0.75 if missing else 1.0,
-            evidence,
-            "Layout consistency uses inverse content-density variation (45%), inverse overlap (30%), and inverse clipping (25%).",
-            missing,
-        )
-
-    hierarchy = _score_record(None, None, [], "Visual hierarchy combines title and slide-type evidence.", [])
-    required = ("title_coverage", "slide_type_coverage")
-    if all(_number(metrics.get(key)) is not None for key in required):
-        score = (_number(metrics["title_coverage"]) * 0.60 + _number(metrics["slide_type_coverage"]) * 0.40) * SCORE_SCALE
-        evidence = sorted({slide for key in required for slide in details.get(key, {}).get("evidence_slides", [])})
-        missing = [item for key in required for item in details.get(key, {}).get("missing_evidence", [])]
-        hierarchy = _score_record(score, 0.75 if missing else 1.0, evidence, "Visual hierarchy combines title coverage (60%) and non-unknown slide-type coverage (40%).", missing)
-
-    visibility = _metric_score(metrics, details, "evidence_visibility", lambda value: value * SCORE_SCALE, "Evidence visibility is scored from visible or partial evidence stages.")
-    originality = _metric_score(metrics, details, "duplicate_content", lambda value: (1 - value) * SCORE_SCALE, "Content originality is the inverse of duplicate visible slide text.")
-    prototype = _metric_score(metrics, details, "link_prototype_evidence", lambda value: value * SCORE_SCALE, "Prototype evidence is based on concrete links or meaningful evidence images, not counts alone.")
-    content_structure = _metric_score(
+    flow = _metric_score(
         metrics,
         details,
-        "content_structure_score",
+        "narrative_flow",
         lambda value: value * SCORE_SCALE,
-        "Content structure rewards pointer-friendly text and penalizes paragraph-heavy or broad unsupported claims.",
+        "Narrative flow checks progression from the problem through solution/build evidence toward a conclusion or next step.",
     )
-    visual_coverage = _metric_score(
+    visual = _metric_score(
         metrics,
         details,
-        "visual_coverage",
+        "visual_relevance_coherence",
         lambda value: value * SCORE_SCALE,
-        "Visual coverage rewards meaningful visuals occupying a useful portion of each slide, not decorative image counts.",
+        "Visual relevance rewards explanatory, confidently classified visuals and does not infer AI authorship.",
     )
-    space_usage = _metric_score(
-        metrics,
-        details,
-        "space_usage",
-        lambda value: value * SCORE_SCALE,
-        "Space usage penalizes excessive unused slide area and unusually large empty regions.",
-    )
+    layout = _layout_space_usage(metrics, details)
     return {
+        "text_visual_balance": balance,
+        "content_structure": structure,
         "readability": readability,
-        "layout_consistency": layout,
-        "visual_hierarchy": hierarchy,
-        "evidence_visibility": visibility,
-        "content_originality": originality,
-        "content_structure": content_structure,
-        "visual_coverage": visual_coverage,
-        "space_usage": space_usage,
-        "prototype_evidence": prototype,
+        "narrative_flow": flow,
+        "visual_relevance_coherence": visual,
+        "layout_space_usage": layout,
     }
 
 
@@ -1061,8 +1413,8 @@ def _finding(
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "category": category,
-        "title": _text(title),
-        "detail": _text(detail),
+        "title": _brief(title, 90),
+        "detail": _brief(detail, 260),
         "evidence_slides": _unique_numbers(evidence_slides),
     }
     if metric is not None:
@@ -1075,6 +1427,13 @@ def _finding(
     if missing:
         result["missing_evidence"] = missing
     return result
+
+
+def _brief(value: Any, limit: int = 260) -> str:
+    text = _text(value)
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 3)].rstrip() + "..."
 
 
 def _build_findings(
@@ -1362,6 +1721,156 @@ def _build_findings(
     }
 
 
+def _build_findings_v2(
+    metrics: Mapping[str, Any],
+    details: Mapping[str, Mapping[str, Any]],
+    deterministic: Mapping[str, Mapping[str, Any]],
+    semantic: Mapping[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Build short findings without repeating every scoring signal."""
+    strengths: list[dict[str, Any]] = []
+    weaknesses: list[dict[str, Any]] = []
+    ambiguous: list[dict[str, Any]] = []
+
+    def add_record(key: str, record: Mapping[str, Any]) -> None:
+        score = _number(record.get("score"))
+        evidence = record.get("evidence_slides", [])
+        missing = record.get("missing_evidence", [])
+        title = key.replace("_", " ").capitalize()
+        if score is None:
+            ambiguous.append(
+                _finding(
+                    "unavailable",
+                    f"{title} not scored",
+                    record.get("explanation") or "The required evidence was unavailable.",
+                    evidence,
+                    metric=key,
+                    confidence=record.get("confidence"),
+                    missing_evidence=missing,
+                )
+            )
+        elif missing:
+            weaknesses.append(
+                _finding(
+                    key,
+                    f"Evidence gap: {title}",
+                    f"{record.get('explanation') or 'The criterion is only partly supported.'} Missing: {'; '.join(str(item) for item in missing[:3])}.",
+                    evidence,
+                    metric=key,
+                    score=score,
+                    confidence=record.get("confidence"),
+                    missing_evidence=missing,
+                )
+            )
+        elif score < 60:
+            weaknesses.append(
+                _finding(
+                    key,
+                    f"{title}: {score:.0f}/100",
+                    record.get("explanation") or "The cited evidence leaves material gaps.",
+                    evidence,
+                    metric=key,
+                    score=score,
+                    confidence=record.get("confidence"),
+                    missing_evidence=missing,
+                )
+            )
+        elif score >= 85:
+            strengths.append(
+                _finding(
+                    key,
+                    f"{title}: {score:.0f}/100",
+                    record.get("explanation") or "The cited evidence is strong for this criterion.",
+                    evidence,
+                    metric=key,
+                    score=score,
+                    confidence=record.get("confidence"),
+                    missing_evidence=missing,
+                )
+            )
+
+    for key in DECK_COMPONENT_WEIGHTS:
+        record = deterministic.get(key)
+        if isinstance(record, Mapping):
+            add_record(key, record)
+
+    # These are supporting diagnostics, not additional weighted components.
+    # Keep them visible because they explain a low balance or layout result.
+    visual_coverage = _number(metrics.get("visual_coverage"))
+    if visual_coverage is not None and visual_coverage < 0.35:
+        visual_detail = details.get("visual_coverage", {})
+        weaknesses.append(
+            _finding(
+                "visual_coverage",
+                "Limited visual support",
+                "Meaningful visuals occupy little of the deck; this is considered within text-visual balance rather than scored as a separate component.",
+                visual_detail.get("evidence_slides", []),
+                metric="visual_coverage",
+                value=visual_coverage,
+            )
+        )
+    space_usage = _number(metrics.get("space_usage"))
+    if space_usage is not None and space_usage < 0.65:
+        space_detail = details.get("space_usage", {})
+        weaknesses.append(
+            _finding(
+                "space_usage",
+                "Unbalanced space usage",
+                "Large unused regions reduce layout and space-use quality; intentional whitespace is not penalized by itself.",
+                space_detail.get("evidence_slides", []),
+                metric="space_usage",
+                value=space_usage,
+            )
+        )
+
+    semantic_scores = semantic.get("scores") if isinstance(semantic.get("scores"), Mapping) else {}
+    semantic_status = str(semantic.get("status") or "unavailable")
+    for key in PROPOSAL_COMPONENT_WEIGHTS:
+        record = semantic_scores.get(key)
+        if isinstance(record, Mapping):
+            add_record(key, record)
+    if semantic_status != "available":
+        ambiguous.append(
+            _finding(
+                "proposal_strength",
+                "Proposal strength not assessed",
+                "A validated semantic response was unavailable, so proposal quality was not guessed from presentation polish.",
+            )
+        )
+
+    filler = _number(metrics.get("generic_filler_ratio"))
+    filler_detail = details.get("generic_filler_ratio", {})
+    if filler is not None and filler >= 0.25:
+        weaknesses.append(
+            _finding(
+                "deck_quality",
+                "Generic filler detected",
+                "Several visible text blocks use broad presentation filler. This affects deck communication only; AI assistance was not inferred.",
+                filler_detail.get("evidence_slides", []),
+                metric="generic_filler_ratio",
+                value=filler,
+            )
+        )
+
+    quality_penalty = semantic.get("quality_penalty")
+    if isinstance(quality_penalty, Mapping) and _number(quality_penalty.get("points")) not in {None, 0.0}:
+        points = _number(quality_penalty.get("points"))
+        weaknesses.append(
+            _finding(
+                "ai_slop",
+                f"Additional deck-quality deduction: {points:.0f} point{'s' if points != 1 else ''}",
+                quality_penalty.get("reason") or "Repeated or material presentation-quality issues were observed.",
+                quality_penalty.get("evidence_slides", []),
+                metric="quality_penalty",
+                value=points,
+            )
+        )
+
+    # Keep the JSON useful for auditing while the Markdown renderer limits the
+    # visible report to the most relevant three items per section.
+    return {"strengths": strengths, "weaknesses": weaknesses, "ambiguous_points": ambiguous}
+
+
 def _evaluation_fingerprint(
     ir: EvaluatorIR,
     problem: ProblemStatement | None,
@@ -1395,7 +1904,7 @@ def _evaluation_fingerprint(
 
 def _semantic_empty(status: str, reason: str) -> dict[str, Any]:
     scores = {
-        key: _score_record(None, None, [], reason, [reason])
+        key: {**_score_record(None, None, [], reason, [reason]), "subcriteria": {}}
         for key in SEMANTIC_COMPONENTS
     }
     return {
@@ -1404,15 +1913,16 @@ def _semantic_empty(status: str, reason: str) -> dict[str, Any]:
         "status": status,
         "cache_hit": False,
         "scores": scores,
+        "quality_penalty": {"points": None, "reason": reason, "evidence_slides": [], "non_overlap_reason": "Not assessed."},
         "error": reason,
     }
 
 
 def _semantic_schema() -> dict[str, Any]:
-    component = {
+    base_component = {
         "type": "OBJECT",
         "properties": {
-            "score": {"type": "NUMBER"},
+            "score": {"type": "NUMBER", "nullable": True},
             "confidence": {"type": "NUMBER"},
             "evidence_slides": {"type": "ARRAY", "items": {"type": "INTEGER"}},
             "explanation": {"type": "STRING"},
@@ -1420,6 +1930,25 @@ def _semantic_schema() -> dict[str, Any]:
         },
         "required": ["score", "confidence", "evidence_slides", "explanation", "missing_evidence"],
     }
+
+    def alignment_component() -> dict[str, Any]:
+        child = {
+            "type": "OBJECT",
+            "properties": {
+                "id": {"type": "STRING"},
+                **base_component["properties"],
+            },
+            "required": ["id", *base_component["required"]],
+        }
+        return {
+            "type": "OBJECT",
+            "properties": {
+                **base_component["properties"],
+                "requirement_scores": {"type": "ARRAY", "items": child},
+            },
+            "required": list(base_component["required"]),
+        }
+
     review_area = {
         "type": "OBJECT",
         "properties": {
@@ -1470,18 +1999,31 @@ def _semantic_schema() -> dict[str, Any]:
             "schema_version": {"type": "STRING", "enum": [SEMANTIC_SCHEMA_VERSION]},
             "scores": {
                 "type": "OBJECT",
-                "properties": {key: component for key in SEMANTIC_COMPONENTS},
+                "properties": {
+                    key: alignment_component() if key == "problem_statement_alignment" else base_component
+                    for key in SEMANTIC_COMPONENTS
+                },
                 "required": list(SEMANTIC_COMPONENTS),
             },
             "review": review,
+            "quality_penalty": {
+                "type": "OBJECT",
+                "properties": {
+                    "points": {"type": "INTEGER", "nullable": True},
+                    "reason": {"type": "STRING"},
+                    "evidence_slides": {"type": "ARRAY", "items": {"type": "INTEGER"}},
+                    "non_overlap_reason": {"type": "STRING"},
+                },
+                "required": ["points", "reason", "evidence_slides", "non_overlap_reason"],
+            },
         },
-        "required": ["schema_version", "scores"],
+        "required": ["schema_version", "scores", "quality_penalty"],
     }
 
 
 def validate_semantic_payload(value: Any, slide_numbers: Sequence[int] = ()) -> tuple[bool, str]:
     """Validate the strict Gemini score and reviewer-response contract."""
-    if not isinstance(value, Mapping) or not {"schema_version", "scores"} <= set(value) or set(value) - {"schema_version", "scores", "review"}:
+    if not isinstance(value, Mapping) or not {"schema_version", "scores", "quality_penalty"} <= set(value) or set(value) - {"schema_version", "scores", "review", "quality_penalty"}:
         return False, "semantic response contains unsupported or missing top-level fields"
     if value.get("schema_version") != SEMANTIC_SCHEMA_VERSION:
         return False, "semantic response schema version is unsupported"
@@ -1489,23 +2031,64 @@ def validate_semantic_payload(value: Any, slide_numbers: Sequence[int] = ()) -> 
     if not isinstance(scores, Mapping) or set(scores) != set(SEMANTIC_COMPONENTS):
         return False, "semantic response scores do not match the required components"
     allowed_slides = set(slide_numbers)
-    for component in SEMANTIC_COMPONENTS:
-        item = scores[component]
-        if not isinstance(item, Mapping) or set(item) != {"score", "confidence", "evidence_slides", "explanation", "missing_evidence"}:
+    records = []
+    for component, item in scores.items():
+        expected_keys = {"score", "confidence", "evidence_slides", "explanation", "missing_evidence"}
+        if not isinstance(item, Mapping) or not expected_keys <= set(item):
             return False, f"semantic component {component} has an invalid schema"
+        child_key = "requirement_scores" if "requirement_scores" in item else "subcriteria"
+        extra_keys = set(item) - expected_keys
+        if extra_keys - {child_key}:
+            return False, f"semantic component {component} has an invalid schema"
+        if component == "prototype_evidence" and child_key in item:
+            return False, "prototype evidence must not have subcriteria"
+        children = item.get(child_key, [])
+        if not isinstance(children, list):
+            return False, f"semantic component {component} requires subcriteria"
+        ids = []
+        for child in children:
+            if not isinstance(child, Mapping) or set(child) != {"id", "score", "confidence", "evidence_slides", "explanation", "missing_evidence"} or not isinstance(child["id"], str):
+                return False, f"semantic component {component} has invalid subcriteria"
+            ids.append(child["id"])
+            records.append((component, child))
+        if component != "prototype_evidence" and len(set(ids)) != len(ids):
+            return False, f"semantic component {component} has incorrect subcriteria"
+        if component == "problem_statement_alignment" and len(set(ids)) != len(ids):
+            return False, "problem-statement alignment requirement ids must be unique"
+        if component == "prototype_evidence" and (children or item["score"] not in (None, 0, 25, 50, 75, 100)):
+            return False, "prototype evidence must use maturity levels 0/25/50/75/100 and no subcriteria"
+        records.append((component, item))
+    for component, item in records:
         score = _number(item.get("score"))
         confidence = _number(item.get("confidence"))
-        if score is None or not 0 <= score <= SCORE_SCALE:
+        if item.get("score") is not None and (score is None or not 0 <= score <= SCORE_SCALE):
             return False, f"semantic component {component} has an invalid score"
         if confidence is None or not 0 <= confidence <= 1:
             return False, f"semantic component {component} has an invalid confidence"
         evidence = item.get("evidence_slides")
-        if not isinstance(evidence, list) or any(_number(slide) is None or _number(slide) < 1 for slide in evidence):
+        if not isinstance(evidence, list) or any(type(slide) is not int or slide < 1 for slide in evidence):
             return False, f"semantic component {component} has invalid evidence slides"
         if allowed_slides and any(int(_number(slide)) not in allowed_slides for slide in evidence):
             return False, f"semantic component {component} references an unknown slide"
         if not isinstance(item.get("explanation"), str) or not isinstance(item.get("missing_evidence"), list) or not all(isinstance(item, str) for item in item["missing_evidence"]):
             return False, f"semantic component {component} has invalid evidence text"
+        if not item["explanation"].strip() or (score is not None and not evidence) or (score is None and not item["missing_evidence"]):
+            return False, f"semantic component {component} requires cited support or an evaluator limitation"
+    penalty = value["quality_penalty"]
+    if not isinstance(penalty, Mapping) or set(penalty) != {"points", "reason", "evidence_slides", "non_overlap_reason"}:
+        return False, "invalid quality penalty schema"
+    points = penalty["points"]
+    if points is not None and (type(points) is not int or not 0 <= points <= 4):
+        return False, "quality penalty must be an integer from 0 to 4 or null"
+    if any(not isinstance(penalty[key], str) for key in ("reason", "non_overlap_reason")):
+        return False, "quality penalty requires explanation text"
+    valid, error = _validate_review_slides(penalty["evidence_slides"], allowed_slides)
+    if not valid:
+        return False, error
+    if not penalty["reason"].strip() or not penalty["non_overlap_reason"].strip():
+        return False, "quality penalty requires reason and non-overlap justification"
+    if points and not penalty["evidence_slides"]:
+        return False, "positive quality penalty requires cited slides"
     if "review" in value:
         valid, error = _validate_review_payload(value["review"], allowed_slides)
         if not valid:
@@ -1562,7 +2145,7 @@ def _validate_review_payload(value: Any, allowed_slides: set[int]) -> tuple[bool
 
 
 def _validate_review_slides(value: Any, allowed_slides: set[int]) -> tuple[bool, str]:
-    if not isinstance(value, list) or any(_number(slide) is None or _number(slide) < 1 for slide in value):
+    if not isinstance(value, list) or any(type(slide) is not int or slide < 1 for slide in value):
         return False, "semantic review has invalid evidence slides"
     if allowed_slides and any(int(_number(slide)) not in allowed_slides for slide in value):
         return False, "semantic review references an unknown slide"
@@ -1700,18 +2283,69 @@ def _semantic_prompt(ir: EvaluatorIR, problem: ProblemStatement | None) -> str:
                 ],
                 "tables": slide.get("tables", []),
                 "links": slide.get("links", []),
+                "metrics": slide.get("metrics", {}),
+                "text_blocks": slide.get("text_blocks", []),
             }
         )
-    context = {"problem_statement": problem.to_dict() if problem else None, "slides": slides}
+    context = {
+        "rubric_version": RUBRIC_VERSION,
+        "proposal_component_points": PROPOSAL_COMPONENT_POINTS,
+        "deck_component_points": DECK_COMPONENT_POINTS,
+        "subcriterion_weights": SUBCRITERION_WEIGHTS,
+        "problem_statement": problem.to_dict() if problem else None,
+        "slides": slides,
+    }
     return (
         "Evaluate the proposal using only the supplied presentation evidence. "
         "Return JSON matching the requested schema exactly. Score each component from 0 to 100. "
-        "Set confidence as a required decimal from 0.0 to 1.0, never as a percentage from 0 to 100. "
+        "Use the exact subcriteria ids and weights in context when judging each component. The output must contain "
+        "only direct component records, except that alignment may include a requirement_scores array. Do not return "
+        "subcriteria arrays for the other components. For alignment, return "
+        "requirement_scores with the PS requirement ids, scored individually for coverage and weighted by normalized "
+        "requirement weights. If no PS is supplied, use null alignment. For other components, return the component "
+        "score after applying the listed subcriterion weights; do not substitute presentation polish for evidence. "
+        "Anchors: 0-20 absent or contradicted, 21-40 assertions or generic claims, 41-60 partial and plausible, "
+        "61-80 concrete and supported with limitations, 81-100 unusually complete and well supported. "
+        "Use the full scale: material evidence differences should create meaningful score differences, but do not force "
+        "a gap when submissions show comparable evidence. Do not cluster every team in the middle. "
+        "Reward a buildable unbuilt idea in feasibility separately from prototype maturity. Prototype uses no subcriteria "
+        "and exactly 0 (none), 25 (concept/mockup), "
+        "50 (implemented fragment with observable output), 75 (integrated working workflow demonstrated), "
+        "100 (working prototype with substantive testing/validation shown). Mere URLs, image roles, architecture diagrams, "
+        "or claims of a working product do not prove implementation; never claim external verification. "
+        "For problem alignment, score each requirement by actual mechanism and outcome, not repeated PS wording. "
+        "For solution clarity, inspect mechanism (40%), end-to-end workflow (30%), inputs/outputs (20%), and scope "
+        "boundaries (10%). For technical feasibility, inspect architecture (35%), implementation plan "
+        "(25%), resources/dependencies (25%), and risks/mitigations (15%); named technologies and hypothetical promises "
+        "are not implementation evidence. For uniqueness, inspect differentiation (40%), problem-specific value (40%), "
+        "and justification (20%). Unsupported performance or impact claims must remain unverified and reduce the relevant "
+        "proposal criterion; impact is not a separate scored criterion. "
+        "For deck criteria judge each slide's purpose: text-only slides and intentional whitespace can be excellent. "
+        "Text walls with less visual explanation should lose balance and structure points. Visual-heavy slides with too little "
+        "labeling or explanation should also lose balance and visual relevance points. Do not require a 50:50 area split. "
+        "For deck criteria use these subcriteria: balance purpose-fit (40%), complementarity (35%), information-load (25%); "
+        "content structure concise writing (50%), organization (30%), precision (20%); readability legibility (40%), "
+        "contrast (25%), hierarchy (20%), unobstructed content (15%); flow logical progression (40%), connections (35%), "
+        "pacing (25%); visual relevance explanatory usefulness (50%), semantic coherence (30%), consistent labels (20%); "
+        "layout alignment/grouping (40%), purposeful space (35%), consistency (25%). Assess readable contrast, hierarchy, "
+        "coherent PS-to-conclusion flow, relevant visuals and consistent meaningful labels. "
+        "Never infer AI authorship or punish AI-assisted content. Discuss only observable generic filler, irrelevant decorative "
+        "imagery, garbled labels, template leftovers, or a visibly incoherent visual language. Color variety alone is not a fault. "
+        "Apply quality_penalty only for a repeated/material deck-wide communication problem not already counted in a component. "
+        "All numeric judgments including absence must cite inspected slides. Distinguish absent submission evidence "
+        "(low score, explain in missing_evidence) from unavailable evaluator evidence (null score, explain limitation). "
+        "Do not award visual quality you cannot observe; missing required observations require null. "
+        "quality_penalty is an additional integer 0-4 in final deck points for repeated/material deck-wide quality issues, "
+        "with cited slides and reason. Default 0 when inspected with no additional issue, null when unassessable. "
+        "Do not automatically double count issues already reflected in criteria: non_overlap_reason must justify the "
+        "distinct additional deck-wide harm; otherwise use 0. "
+        "Keep every explanation to one short, evidence-backed sentence (preferably 25 words or fewer), and list at most "
+        "three missing evidence items per component. Set confidence as a required decimal from 0.0 to 1.0, never as a percentage from 0 to 100. "
         "Always provide a numeric confidence even when evidence is weak or missing. "
         "Cite only slide numbers that support the component. If evidence is absent, list it in "
         "missing_evidence and do not infer it from presentation polish. Do not return nodes, edges, "
         "rankings, or any fields outside the schema. Also provide a reviewer object with exactly "
-        "one 0-10 rating and evidence-grounded reason for each area: fit_to_problem, "
+        "one 0-10 rating and concise evidence-grounded reason for each area: fit_to_problem, "
         "technical_approach, validation_presented, differentiation, and presentation. List "
         "concrete strengths, specific risks that prevent a higher rating, the next evidence that "
         "would most improve confidence, a decision of advance_to_demo, needs_revision, or "
@@ -1732,6 +2366,7 @@ def _cache_root(cache_dir: str | Path | None) -> Path:
 def _semantic_cache_key(prompt: str, images: Sequence[VisionImage]) -> str:
     digest = hashlib.sha256()
     digest.update(SEMANTIC_SCHEMA_VERSION.encode("utf-8"))
+    digest.update(RUBRIC_VERSION.encode("utf-8"))
     digest.update(SEMANTIC_MODEL.encode("utf-8"))
     digest.update(prompt.encode("utf-8"))
     for image in images:
@@ -1763,9 +2398,75 @@ def _write_semantic_cache(path: Path, content_hash: str, response: Mapping[str, 
     temporary.replace(path)
 
 
+def _aggregate_semantics(result: dict[str, Any], response: Mapping[str, Any], problem: ProblemStatement | None,
+                         slide_numbers: Sequence[int], observed_slides: set[int]) -> dict[str, Any]:
+    """Compute authoritative totals; semantic totals never override rubric arithmetic."""
+    rendered_complete = bool(slide_numbers) and set(slide_numbers) <= observed_slides
+    result["rendered_slide_numbers"] = sorted(observed_slides)
+    result["rendered_evidence_complete"] = rendered_complete
+    for key in SEMANTIC_COMPONENTS:
+        raw = response["scores"][key]
+        weights = (
+            {item["id"]: item["weight"] for item in problem.requirements}
+            if problem and key == "problem_statement_alignment"
+            else SUBCRITERION_WEIGHTS.get(key, {})
+        )
+        raw_children = raw.get("subcriteria", raw.get("requirement_scores", []))
+        children = {
+            item["id"]: _score_record(
+                item["score"],
+                item["confidence"],
+                item["evidence_slides"],
+                item["explanation"],
+                item["missing_evidence"],
+            )
+            for item in raw_children
+        }
+        if weights and raw_children:
+            if set(children) != set(weights):
+                # Some Gemini responses still emit legacy subcriteria labels
+                # despite the compact schema. Keep the valid top-level score
+                # instead of invalidating every proposal criterion.
+                record = _score_record(
+                    raw["score"],
+                    raw["confidence"],
+                    raw["evidence_slides"],
+                    raw["explanation"],
+                    raw["missing_evidence"],
+                )
+                record["subcriteria"] = children
+            else:
+                record = _weighted_group(key, children, weights, raw["explanation"], 0)
+                record["subcriteria"] = record.pop("components")
+                record["missing_evidence"] = _missing([*record["missing_evidence"], *raw["missing_evidence"]])
+        else:
+            record = _score_record(
+                raw["score"],
+                raw["confidence"],
+                raw["evidence_slides"],
+                raw["explanation"],
+                raw["missing_evidence"],
+            )
+            record["subcriteria"] = {}
+        if key == "problem_statement_alignment" and problem is None:
+            record.update(_score_record(None, None, [], "No problem statement supplied.", ["problem statement unavailable"]))
+            record["subcriteria"] = children
+        result["scores"][key] = record
+    quality_penalty = dict(response["quality_penalty"])
+    if not rendered_complete:
+        quality_penalty = {
+            "points": 0,
+            "reason": "No additional deck-wide penalty applied because complete rendered-slide evidence was unavailable.",
+            "evidence_slides": [],
+            "non_overlap_reason": "A visual authorship or style judgment was not inferred without complete rendered slides.",
+        }
+    result["quality_penalty"] = quality_penalty
+    return result
+
+
 def evaluate_semantics(
     ir: EvaluatorIR,
-    problem: ProblemStatement,
+    problem: ProblemStatement | None,
     *,
     render_dir: str | Path | None = None,
     adapter: SemanticAdapter | None = None,
@@ -1778,8 +2479,13 @@ def evaluate_semantics(
     """Run optional Gemini semantic scoring with strict validation and caching."""
     if skip:
         return _semantic_empty("not_requested", "semantic evaluation was disabled")
+    if not _slides(ir):
+        return _semantic_empty("unavailable", "no slides are available for evaluation")
     images = _rendered_images(ir, render_dir)
     prompt = _semantic_prompt(ir, problem)
+    slide_numbers = [_slide_number(slide, index) for index, slide in enumerate(_slides(ir), 1)]
+    observed_slides = {int(image.label.split(":")[1]) for image in images}
+    prompt += "\nAttached rendered images, in order: " + json.dumps([image.label for image in images])
     content_hash = _semantic_cache_key(prompt, images)
     cache_path = _cache_root(cache_dir) / f"{content_hash}.json"
     cached = None
@@ -1809,7 +2515,7 @@ def evaluate_semantics(
         }
         if isinstance(cached.get("review"), Mapping):
             result["review"] = dict(cached["review"])
-        return result
+        return _aggregate_semantics(result, cached, problem, slide_numbers, observed_slides)
 
     semantic_adapter = adapter or GeminiSemanticAdapter(api_key=api_key)
     if isinstance(semantic_adapter, GeminiSemanticAdapter) and not semantic_adapter.api_key:
@@ -1851,7 +2557,7 @@ def evaluate_semantics(
     }
     if isinstance(response.get("review"), Mapping):
         result["review"] = dict(response["review"])
-    return result
+    return _aggregate_semantics(result, response, problem, slide_numbers, observed_slides)
 
 
 def evaluate_deck(
@@ -1869,6 +2575,7 @@ def evaluate_deck(
     missing_evidence_penalty: float = MISSING_EVIDENCE_PENALTY,
 ) -> dict[str, Any]:
     """Evaluate a deck from canonical DeckIR or compact EvaluatorIR data."""
+    # Keep the shipped CLI/API argument valid, but rubric 2 never deducts per missing item.
     if isinstance(value, EvaluatorIR):
         ir = value
     elif isinstance(value, Mapping) and value.get("schema_version") == EVALUATOR_SCHEMA_VERSION and {"deck", "slides"} <= set(value):
@@ -1885,7 +2592,7 @@ def evaluate_deck(
     if penalty_value is None or penalty_value < 0:
         raise ValueError("missing evidence penalty must be a non-negative finite number")
     metrics, metric_details = compute_deterministic_metrics(ir)
-    deterministic = _deterministic_scores(metrics, metric_details)
+    deterministic = _deterministic_scores(metrics, metric_details, _slides(ir))
 
     problem_statement: ProblemStatement | None = None
     if not deck_only:
@@ -1895,9 +2602,7 @@ def evaluate_deck(
     elif problem is not None:
         problem_statement = load_problem_statement(problem) if isinstance(problem, (str, Path)) else validate_problem_statement(problem)
 
-    if deck_only:
-        semantic = _semantic_empty("not_requested", "deck-only evaluation does not run semantic proposal scoring")
-    elif problem_statement is not None:
+    if not deck_only and problem_statement is not None:
         semantic = evaluate_semantics(
             ir,
             problem_statement,
@@ -1910,29 +2615,75 @@ def evaluate_deck(
             fresh=fresh_semantic,
         )
     else:
-        semantic = _semantic_empty("unavailable", "problem statement is unavailable")
+        semantic = _semantic_empty(
+            "not_requested" if deck_only else "unavailable",
+            "deck-only evaluation does not run semantic proposal scoring"
+            if deck_only
+            else "problem statement is unavailable",
+        )
 
     proposal_components = {
         key: dict(semantic["scores"].get(key, _score_record(None, None, [], "Semantic score unavailable.", [key])))
-        for key in SEMANTIC_COMPONENTS
+        for key in PROPOSAL_COMPONENT_WEIGHTS
     }
-    proposal_components["prototype_evidence"] = deterministic["prototype_evidence"]
     proposal = _weighted_group(
         "proposal_strength",
         proposal_components,
         PROPOSAL_COMPONENT_WEIGHTS,
-        "Proposal strength combines problem alignment, solution clarity, feasibility, innovation, impact, and concrete prototype evidence.",
-        penalty_value,
+        "Proposal strength: alignment 20, clarity 20, feasibility 15, uniqueness 10, prototype evidence 5 points, normalized to 100.",
+        0,
     )
+
+    # Deterministic geometry remains the offline baseline. A semantic deck
+    # score is used only when every slide was actually rendered and supplied
+    # to the model; this prevents unobserved visual polish from being scored.
+    semantic_rendered_complete = bool(semantic.get("rendered_evidence_complete"))
+    semantic_scores = semantic.get("scores") if isinstance(semantic.get("scores"), Mapping) else {}
+    if semantic.get("status") == "available" and semantic_rendered_complete:
+        deck_components = {
+            key: dict(semantic_scores.get(key, deterministic[key]))
+            if isinstance(semantic_scores.get(key), Mapping) and _number(semantic_scores[key].get("score")) is not None
+            else deterministic[key]
+            for key in DECK_COMPONENT_WEIGHTS
+        }
+        deck_scoring_source = "semantic_rendered"
+    else:
+        deck_components = {key: deterministic[key] for key in DECK_COMPONENT_WEIGHTS}
+        deck_scoring_source = "deterministic"
     deck_quality = _weighted_group(
         "deck_quality",
-        {key: deterministic[key] for key in DECK_COMPONENT_WEIGHTS},
+        deck_components,
         DECK_COMPONENT_WEIGHTS,
-        "Deck quality combines readability, layout consistency, visual hierarchy, evidence visibility, content originality, pointer-friendly content structure, visual coverage, and space usage.",
-        penalty_value,
+        "Deck quality: balance 8, writing/structure 5, readability 5, flow 4, visual coherence 5, layout/space 3 points, normalized to 100.",
+        0,
     )
+    quality_penalty = semantic.get("quality_penalty")
+    if not isinstance(quality_penalty, Mapping) or not semantic_rendered_complete:
+        quality_penalty = {
+            "points": 0,
+            "reason": "No additional deck-wide penalty was applied; rendered-slide quality was not fully assessed.",
+            "evidence_slides": [],
+            "non_overlap_reason": "AI authorship was not inferred and no distinct deck-wide issue was verified.",
+        }
+    else:
+        quality_penalty = dict(quality_penalty)
+    penalty_points = _number(quality_penalty.get("points"))
+    if penalty_points is None:
+        quality_penalty["points"] = 0
+        quality_penalty["reason"] = quality_penalty.get("reason") or "No additional deck-wide penalty was applied."
+        quality_penalty["non_overlap_reason"] = quality_penalty.get("non_overlap_reason") or "No distinct additional issue was verified."
+        penalty_points = 0.0
+    deck_quality["quality_penalty"] = quality_penalty
+    deck_quality["scoring_source"] = deck_scoring_source
+    deck_quality["points_before_penalty"] = round(deck_quality["score"] * DECK_QUALITY_WEIGHT, 6) if deck_quality["score"] is not None else None
+    if deck_quality["score"] is not None:
+        deck_quality["score"] = round(max(0, deck_quality["points_before_penalty"] - penalty_points) / DECK_QUALITY_WEIGHT, 6)
+    deck_quality["points"] = round(deck_quality["score"] * DECK_QUALITY_WEIGHT, 6) if deck_quality["score"] is not None else None
+    deck_quality["max_points"] = 30
+    proposal["points"] = round(proposal["score"] * PROPOSAL_STRENGTH_WEIGHT, 6) if proposal["score"] is not None else None
+    proposal["max_points"] = 70
     final_missing = []
-    if proposal["score"] is None:
+    if proposal["score"] is None or deck_only:
         final_missing.append("proposal_strength score is unavailable")
     if deck_quality["score"] is None:
         final_missing.append("deck_quality score is unavailable")
@@ -1941,8 +2692,8 @@ def evaluate_deck(
         final_score = None
         final_confidence = None
     else:
-        final_explanation = "Final score = 0.70 * proposal_strength + 0.30 * deck_quality."
-        final_score = PROPOSAL_STRENGTH_WEIGHT * proposal["score"] + DECK_QUALITY_WEIGHT * deck_quality["score"]
+        final_explanation = "Final score = proposal points (out of 70) + deck points (out of 30, after quality penalty with floor 0)."
+        final_score = proposal["points"] + deck_quality["points"]
         final_confidence = PROPOSAL_STRENGTH_WEIGHT * proposal["confidence"] + DECK_QUALITY_WEIGHT * deck_quality["confidence"]
     final = _score_record(
         final_score,
@@ -1951,24 +2702,28 @@ def evaluate_deck(
         final_explanation,
         [*final_missing, *proposal.get("missing_evidence", []), *deck_quality.get("missing_evidence", [])],
     )
-    findings = _build_findings(metrics, metric_details, deterministic, semantic)
+    findings = _build_findings_v2(metrics, metric_details, {**deck_components, **({"deck_quality": deck_quality} if deck_quality else {})}, semantic)
     evaluation_fingerprint = _evaluation_fingerprint(
         ir,
         problem_statement,
         metrics,
         metric_details,
         semantic,
-        penalty_value,
+        0,
     )
     return {
         "schema_version": EVALUATION_SCHEMA_VERSION,
         "rubric_version": RUBRIC_VERSION,
         "evaluation_fingerprint": evaluation_fingerprint,
         "score_scale": SCORE_SCALE,
-        "missing_evidence_penalty_per_item": penalty_value,
+        "missing_evidence_penalty_per_item": 0.0,
+        "quality_penalty": quality_penalty,
+        "status": "REVIEW" if final["score"] is None else "SCORED",
         "weights": {
             "proposal_strength": PROPOSAL_STRENGTH_WEIGHT,
             "deck_quality": DECK_QUALITY_WEIGHT,
+            "proposal_component_points": PROPOSAL_COMPONENT_POINTS,
+            "deck_component_points": DECK_COMPONENT_POINTS,
         },
         "evaluator_ir_schema_version": ir.schema_version,
         "deck": dict(ir.deck),

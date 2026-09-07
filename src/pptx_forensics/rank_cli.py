@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from .config import load_dotenv
 from .deck_evaluation import MISSING_EVIDENCE_PENALTY, ProblemStatementError, load_problem_statement
 from .problem_scraper import DEFAULT_SIH_PROBLEM_URL, OfficialProblemScraper
 from .ranking import (
@@ -55,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-ocr", action="store_true", help="skip OCR")
     parser.add_argument("--skip-diagrams", action="store_true", help="skip diagram reconstruction")
     parser.add_argument("--skip-vision", action="store_true", help="skip Gemini vision")
-    parser.add_argument("--skip-semantic", action="store_true", help="skip Gemini semantic proposal scoring")
+    parser.add_argument("--skip-semantic", action="store_true", help="skip Gemini semantic proposal and rendered-quality scoring")
     parser.add_argument("--aurochs-root", type=Path, help="Aurochs checkout for PPTX rendering")
     parser.add_argument("--pdf-render-dpi", type=int, default=144)
     parser.add_argument("--render-cache-dir", type=Path)
@@ -77,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         "--missing-evidence-penalty",
         type=float,
         default=MISSING_EVIDENCE_PENALTY,
-        help="points deducted per distinct missing-evidence item",
+        help="deprecated compatibility option; rubric 2 scores missing evidence within the affected criterion",
     )
     parser.add_argument("--excellent-threshold", type=float, default=85.0)
     parser.add_argument("--strong-threshold", type=float, default=70.0)
@@ -86,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        load_dotenv()
         manifest_path = args.manifest
         if manifest_path is None and not args.sources and not args.input_dir:
             for candidate in (Path("submissions.tsv"), Path("/opt/application/submissions.tsv")):

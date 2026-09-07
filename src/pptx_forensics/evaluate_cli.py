@@ -32,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
         "--missing-evidence-penalty",
         type=float,
         default=MISSING_EVIDENCE_PENALTY,
-        help="points deducted per distinct missing-evidence item",
+        help="deprecated compatibility option; rubric 2 scores missing evidence within the affected criterion",
     )
     parser.add_argument("--output", type=Path, help="write evaluation JSON to this path instead of stdout")
     args = parser.parse_args(argv)
