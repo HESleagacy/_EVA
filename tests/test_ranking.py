@@ -38,6 +38,15 @@ def test_infer_ps_id_reads_official_id_tokens_from_document_text() -> None:
     assert infer_ps_id(report, "team-submission.pdf") == "26168"
 
 
+def test_infer_ps_id_handles_line_breaks_inside_official_id() -> None:
+    report = SimpleNamespace(slides=[SimpleNamespace(text=["Problem Statement ID – SIH2\n6013"])])
+
+    assert infer_ps_id(report, "team-submission.pdf") == "26013"
+
+    spaced = SimpleNamespace(slides=[SimpleNamespace(text=["Problem Statement ID – S I H 2 6 0 8 1"])])
+    assert infer_ps_id(spaced, "team-submission.pdf") == "26081"
+
+
 def test_bucket_thresholds_and_rank_order_are_deterministic() -> None:
     thresholds = BucketThresholds(excellent=90, strong=75, promising=60)
     assert bucket_for_score(90, thresholds) == "A - Excellent"

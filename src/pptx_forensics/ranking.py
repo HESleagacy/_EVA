@@ -34,7 +34,7 @@ from .vision import DEFAULT_MAX_OUTPUT_TOKENS, run_selective_vision
 SUPPORTED_INPUT_SUFFIXES = frozenset({".pdf", ".pptx"})
 RANKING_SCHEMA_VERSION = "submission-ranking-1.0"
 _PS_ID_PATTERNS = (
-    re.compile(r"\bsih\s*[-_:#]?\s*(\d{5,8})\b", re.IGNORECASE),
+    re.compile(r"\bs\s*i\s*h\s*[-_:#]?\s*(\d(?:[\s_-]*\d){4,7})\b", re.IGNORECASE),
     re.compile(
         r"problem\s+statement\s+(?:id|number|no)\s*[:#\-–—]?\s*([A-Za-z0-9][A-Za-z0-9_-]*)",
         re.IGNORECASE,
@@ -202,7 +202,10 @@ def infer_ps_id(report: Any, source: str | Path) -> str:
     for pattern in _PS_ID_PATTERNS:
         match = pattern.search(text)
         if match:
-            return normalize_ps_id(match.group(1))
+            value = match.group(1)
+            if pattern is _PS_ID_PATTERNS[0]:
+                value = re.sub(r"[\s_-]+", "", value)
+            return normalize_ps_id(value)
     filename_match = _FILENAME_PS_PATTERN.search(Path(source).stem)
     if filename_match:
         return normalize_ps_id(filename_match.group(1))

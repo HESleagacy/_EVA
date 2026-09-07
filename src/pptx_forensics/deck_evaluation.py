@@ -2072,7 +2072,15 @@ def validate_semantic_payload(value: Any, slide_numbers: Sequence[int] = ()) -> 
             return False, f"semantic component {component} references an unknown slide"
         if not isinstance(item.get("explanation"), str) or not isinstance(item.get("missing_evidence"), list) or not all(isinstance(item, str) for item in item["missing_evidence"]):
             return False, f"semantic component {component} has invalid evidence text"
-        if not item["explanation"].strip() or (score is not None and not evidence) or (score is None and not item["missing_evidence"]):
+        child_has_support = any(
+            isinstance(child, Mapping) and (child.get("evidence_slides") or child.get("missing_evidence"))
+            for child in children
+        )
+        if (
+            not item["explanation"].strip()
+            or (score is not None and not evidence and not item["missing_evidence"] and not child_has_support and not children)
+            or (score is None and not item["missing_evidence"] and not child_has_support and not children)
+        ):
             return False, f"semantic component {component} requires cited support or an evaluator limitation"
     penalty = value["quality_penalty"]
     if not isinstance(penalty, Mapping) or set(penalty) != {"points", "reason", "evidence_slides", "non_overlap_reason"}:
@@ -2522,18 +2530,29 @@ def evaluate_semantics(
         result = _semantic_empty("unavailable", "GEMINI_API_KEY is not configured")
         result["content_hash"] = content_hash
         return result
-    try:
-        raw = semantic_adapter.analyze(prompt, images, timeout)
-        response = json.loads(raw) if isinstance(raw, str) else raw
-    except Exception as exc:
-        result = _semantic_empty("failed", str(exc))
-        result["content_hash"] = content_hash
-        return result
-    valid, error = validate_semantic_payload(
-        response,
-        [_slide_number(slide, index) for index, slide in enumerate(_slides(ir), 1)],
-    )
-    if not valid:
+    response: Any = None
+    error = "semantic request failed"
+    for _attempt in range(2):
+        attempt_prompt = prompt
+        if _attempt:
+            attempt_prompt += (
+                "\nIMPORTANT VALIDATION RETRY: return a numeric score for every semantic component "
+                "and every alignment requirement. When evidence is absent, use score 0 and list "
+                "the gap in missing_evidence; do not return null scores without missing_evidence."
+            )
+        try:
+            raw = semantic_adapter.analyze(attempt_prompt, images, timeout)
+            response = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception as exc:
+            error = str(exc)
+            continue
+        valid, error = validate_semantic_payload(
+            response,
+            [_slide_number(slide, index) for index, slide in enumerate(_slides(ir), 1)],
+        )
+        if valid:
+            break
+    else:
         result = _semantic_empty("failed", error)
         result["content_hash"] = content_hash
         return result
