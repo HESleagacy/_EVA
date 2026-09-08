@@ -2032,6 +2032,7 @@ def validate_semantic_payload(value: Any, slide_numbers: Sequence[int] = ()) -> 
         return False, "semantic response scores do not match the required components"
     allowed_slides = set(slide_numbers)
     records = []
+    children_by_component: dict[str, list] = {}
     for component, item in scores.items():
         expected_keys = {"score", "confidence", "evidence_slides", "explanation", "missing_evidence"}
         if not isinstance(item, Mapping) or not expected_keys <= set(item):
@@ -2045,6 +2046,7 @@ def validate_semantic_payload(value: Any, slide_numbers: Sequence[int] = ()) -> 
         children = item.get(child_key, [])
         if not isinstance(children, list):
             return False, f"semantic component {component} requires subcriteria"
+        children_by_component[component] = children
         ids = []
         for child in children:
             if not isinstance(child, Mapping) or set(child) != {"id", "score", "confidence", "evidence_slides", "explanation", "missing_evidence"} or not isinstance(child["id"], str):
@@ -2072,14 +2074,15 @@ def validate_semantic_payload(value: Any, slide_numbers: Sequence[int] = ()) -> 
             return False, f"semantic component {component} references an unknown slide"
         if not isinstance(item.get("explanation"), str) or not isinstance(item.get("missing_evidence"), list) or not all(isinstance(item, str) for item in item["missing_evidence"]):
             return False, f"semantic component {component} has invalid evidence text"
+        sibling_children = children_by_component[component]
         child_has_support = any(
             isinstance(child, Mapping) and (child.get("evidence_slides") or child.get("missing_evidence"))
-            for child in children
+            for child in sibling_children
         )
         if (
             not item["explanation"].strip()
-            or (score is not None and not evidence and not item["missing_evidence"] and not child_has_support and not children)
-            or (score is None and not item["missing_evidence"] and not child_has_support and not children)
+            or (score is not None and not evidence and not item["missing_evidence"] and not child_has_support and not sibling_children)
+            or (score is None and not item["missing_evidence"] and not child_has_support and not sibling_children)
         ):
             return False, f"semantic component {component} requires cited support or an evaluator limitation"
     penalty = value["quality_penalty"]

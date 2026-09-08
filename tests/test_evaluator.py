@@ -405,6 +405,29 @@ def test_semantic_quality_penalty_rejects_values_above_four() -> None:
     assert "0 to 4" in error
 
 
+def test_semantic_validation_accepts_unscorable_header_subcriterion_with_supported_siblings() -> None:
+    """A null-score "header" requirement is valid as long as a sibling in the
+    *same* component cites evidence; a leaf component later in the response
+    (with no subcriteria of its own) must not affect that judgment."""
+    response = _semantic_response()
+    alignment = response["scores"]["problem_statement_alignment"]
+    assert alignment["subcriteria"], "fixture must keep problem_statement_alignment's supported sibling"
+    alignment["subcriteria"].append(
+        {
+            "id": "header",
+            "score": None,
+            "confidence": 1.0,
+            "evidence_slides": [],
+            "explanation": "This is a header and not a scorable requirement.",
+            "missing_evidence": [],
+        }
+    )
+
+    valid, error = validate_semantic_payload(response, [1])
+
+    assert valid, error
+
+
 def test_missing_evidence_penalizes_component_and_weighted_scores(tmp_path: Path) -> None:
     source = tmp_path / "missing-evidence.pptx"
     _feature_package(source)
