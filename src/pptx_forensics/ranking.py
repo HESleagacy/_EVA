@@ -52,13 +52,6 @@ _FILENAME_PS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _TEAM_PATTERN = re.compile(r"team\s+name\s*[:#\-–—]?\s*([^\r\n]+)", re.IGNORECASE)
-_REVIEW_AREA_LABELS = {
-    "fit_to_problem": "Fit to the stated problem",
-    "technical_approach": "Technical approach",
-    "validation_presented": "Validation presented",
-    "differentiation": "Differentiation",
-    "presentation": "Presentation",
-}
 
 
 @dataclass(frozen=True)
@@ -118,6 +111,13 @@ def extension_for_url(url: str) -> str:
     parsed_path = urllib.parse.urlsplit(url).path
     suffix = Path(parsed_path).suffix.lower()
     if suffix in SUPPORTED_INPUT_SUFFIXES or suffix == LEGACY_PPT_SUFFIX:
+        return suffix
+    name = Path(parsed_path).name.lower()
+    if ".pptx" in name:
+        return ".pptx"
+    return ".pdf"
+
+
 def convert_legacy_ppt(source: Path, destination_dir: Path) -> Path:
     """Convert a legacy binary PowerPoint file to OOXML for extraction."""
     executable = shutil.which("libreoffice") or shutil.which("soffice")
@@ -140,13 +140,6 @@ def convert_legacy_ppt(source: Path, destination_dir: Path) -> Path:
     if not converted.is_file():
         raise RuntimeError("legacy .ppt conversion did not produce a .pptx file")
     return converted
-
-
-        return suffix
-    name = Path(parsed_path).name.lower()
-    if ".pptx" in name:
-        return ".pptx"
-    return ".pdf"
 
 
 def download_submission_file(url: str, destination: Path, timeout: float = 60.0) -> None:
@@ -495,7 +488,6 @@ def rank_submissions(
     if manifest is not None:
         total = len(manifest)
         for index, entry in enumerate(manifest, 1):
-                    source_file = convert_legacy_ppt(temp_file, Path(dl_dir) / "converted") if ext == LEGACY_PPT_SUFFIX else temp_file
             if progress is not None:
                 progress(index, total, Path(entry.team_name))
             ext = extension_for_url(entry.url)
@@ -503,6 +495,7 @@ def rank_submissions(
                 temp_file = Path(dl_dir) / f"{safe_slug(entry.team_name)}{ext}"
                 try:
                     download_submission_file(entry.url, temp_file, timeout=60.0)
+                    source_file = convert_legacy_ppt(temp_file, Path(dl_dir) / "converted") if ext == LEGACY_PPT_SUFFIX else temp_file
                     result = _process_submission(
                         source_file,
                         team_override=entry.team_name,
@@ -870,65 +863,6 @@ def _finding_section(title: str, findings: Any, *, limit: int | None = None) -> 
         rendered += 1
         if limit is not None and rendered >= limit:
             break
-    lines.append("")
-    return lines
-
-
-def _review_sections(review: Mapping[str, Any]) -> list[str]:
-    areas = review.get("area_reviews", [])
-    ratings = [float(item["rating"]) for item in areas if isinstance(item, Mapping) and _finite_number(item.get("rating"))]
-    overall = sum(ratings) / len(ratings) if ratings else None
-    lines = ["## Reviewer Assessment", ""]
-    if overall is not None:
-        lines.append(f"- Overall reviewer rating: `{overall:.1f}/10`")
-    lines.append(f"- Decision: `{_one_line(review.get('decision', 'needs_revision'))}`")
-    lines.extend(["", "## Area Review", "", "| Area | Rating | Reason |", "| --- | ---: | --- |"])
-    for item in areas:
-        if not isinstance(item, Mapping):
-            continue
-        area = _REVIEW_AREA_LABELS.get(str(item.get("area")), str(item.get("area", "Area")))
-        rating = item.get("rating", "N/A")
-        reason = _one_line(item.get("reason", ""))
-        missing = item.get("missing_evidence")
-        if isinstance(missing, list) and missing:
-            reason += f" Missing: {_one_line('; '.join(str(value) for value in missing))}."
-        lines.append(f"| {_table_text(area)} | {rating}/10 | {reason} |")
-    lines.append("")
-    lines.extend(_review_point_section("What Earns the Score", review.get("strengths", []), "point"))
-    lines.extend(_review_point_section("What Prevents a Higher Score", review.get("risks", []), "risk"))
-    lines.extend(["## Judging Decision", ""])
-    next_evidence = review.get("next_evidence", [])
-    if isinstance(next_evidence, list) and next_evidence:
-        for item in next_evidence:
-            lines.append(f"- {_one_line(item)}")
-    else:
-        lines.append("- No additional evidence request was produced.")
-    lines.append("")
-    limitations = review.get("limitations", [])
-    if isinstance(limitations, list) and limitations:
-        lines.extend(["## Evaluation Limits", ""])
-        for item in limitations:
-            lines.append(f"- {_one_line(item)}")
-        lines.append("")
-    return lines
-
-
-def _review_point_section(title: str, items: Any, kind: str) -> list[str]:
-    lines = [f"## {title}", ""]
-    if not isinstance(items, list) or not items:
-        lines.append("- None reported.")
-        lines.append("")
-        return lines
-    for item in items:
-        if not isinstance(item, Mapping):
-            continue
-        if kind == "point":
-            text = _one_line(item.get("point", ""))
-        else:
-            text = f"**{_one_line(item.get('title', 'Risk'))}**: {_one_line(item.get('detail', ''))}"
-        evidence = item.get("evidence_slides")
-        suffix = f"; slides: {', '.join(str(value) for value in evidence)}" if isinstance(evidence, list) and evidence else ""
-        lines.append(f"- {text}{suffix}")
     lines.append("")
     return lines
 
