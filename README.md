@@ -578,7 +578,8 @@ rendered evidence is unavailable; no unobserved visual polish is awarded.
 ### Local Sequential Workflow
 
 Put every submission PDF or PPTX file in the root
-`submissions/` directory. Supported extensions are `.pdf` and `.pptx`.
+`submissions/` directory. Supported extensions are `.pdf`, `.pptx`, and `.ppt`
+(`.ppt` is converted with LibreOffice, which must be on `PATH`).
 Nested directories are scanned too. The local command discovers files in a
 stable path order and processes exactly one submission at a time:
 
@@ -586,17 +587,18 @@ stable path order and processes exactly one submission at a time:
 review-submissions
 ```
 
-The default input is `./submissions` (or `submissions.tsv` manifest if present) and the default Markdown output is
-`./evidence`. You can also explicitly pass a TSV or CSV manifest of remote URLs:
+The default input is `./submissions` and the default Markdown output is
+`./evidence`. Pass files directly or use `--input-dir` (repeatable) for other folders:
 
 ```bash
-review-submissions --manifest submissions.tsv
+review-submissions decks/alpha.pptx decks/beta.pdf
+review-submissions --input-dir decks --input-dir late-entries
 ```
 
-Every discovered or downloaded file gets a report, including a
+Every discovered file gets a report, including a
 `REVIEW` report when extraction, problem lookup, or evaluation fails; one bad
-file does not stop the remaining files. Each downloaded file is processed in an
-isolated temporary directory and purged immediately after its report is written.
+file does not stop the remaining files. Each file is processed in an
+isolated temporary directory that is purged immediately after its report is written.
 Use `--quiet` only to hide progress messages.
 
 If no `--problem` or `--problem-dir` is supplied, the command reads the PS ID
