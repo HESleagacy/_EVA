@@ -37,7 +37,7 @@ SEMANTIC_MODEL = "gemini-2.5-flash"
 SCORE_SCALE = 100.0
 PROPOSAL_STRENGTH_WEIGHT = 0.70
 DECK_QUALITY_WEIGHT = 0.30
-MISSING_EVIDENCE_PENALTY = 0.0
+MISSING_EVIDENCE_PENALTY = 10.0
 
 SEMANTIC_COMPONENTS = (
     "problem_statement_alignment",
@@ -1285,7 +1285,7 @@ def _weighted_group(
         elif source.get("confidence") is not None:
             weighted_confidence += weight * float(source["confidence"])
             raw_score = _number(source["score"])
-            penalty = 0.0  # Rubric 2 scores submission gaps within criteria, never per missing item.
+            penalty = min(raw_score, missing_evidence_penalty * len(source_missing)) if raw_score is not None else 0.0
             if penalty:
                 source["unpenalized_score"] = round(raw_score, 6)
                 source["missing_evidence_penalty"] = round(penalty, 6)
@@ -2312,7 +2312,6 @@ def evaluate_deck(
     missing_evidence_penalty: float = MISSING_EVIDENCE_PENALTY,
 ) -> dict[str, Any]:
     """Evaluate a deck from canonical DeckIR or compact EvaluatorIR data."""
-    # Keep the shipped CLI/API argument valid, but rubric 2 never deducts per missing item.
     if isinstance(value, EvaluatorIR):
         ir = value
     elif isinstance(value, Mapping) and value.get("schema_version") == EVALUATOR_SCHEMA_VERSION and {"deck", "slides"} <= set(value):
@@ -2368,7 +2367,7 @@ def evaluate_deck(
         proposal_components,
         PROPOSAL_COMPONENT_WEIGHTS,
         "Proposal strength: alignment 20, clarity 20, feasibility 15, uniqueness 10, prototype evidence 5 points, normalized to 100.",
-        0,
+        penalty_value,
     )
 
     # Deterministic geometry remains the offline baseline. A semantic deck
@@ -2392,7 +2391,7 @@ def evaluate_deck(
         deck_components,
         DECK_COMPONENT_WEIGHTS,
         "Deck quality: balance 8, writing/structure 5, readability 5, flow 4, visual coherence 5, layout/space 3 points, normalized to 100.",
-        0,
+        penalty_value,
     )
     quality_penalty = semantic.get("quality_penalty")
     if not isinstance(quality_penalty, Mapping) or not semantic_rendered_complete:
@@ -2446,14 +2445,14 @@ def evaluate_deck(
         metrics,
         metric_details,
         semantic,
-        0,
+        penalty_value,
     )
     return {
         "schema_version": EVALUATION_SCHEMA_VERSION,
         "rubric_version": RUBRIC_VERSION,
         "evaluation_fingerprint": evaluation_fingerprint,
         "score_scale": SCORE_SCALE,
-        "missing_evidence_penalty_per_item": 0.0,
+        "missing_evidence_penalty_per_item": penalty_value,
         "quality_penalty": quality_penalty,
         "status": "REVIEW" if final["score"] is None else "SCORED",
         "weights": {

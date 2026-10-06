@@ -449,10 +449,12 @@ def test_missing_evidence_penalizes_component_and_weighted_scores(tmp_path: Path
     result = evaluate_deck(report, PROBLEM, semantic_adapter=Adapter(), semantic_cache_dir=tmp_path / "cache")
     alignment = result["scores"]["proposal_strength"]["components"]["problem_statement_alignment"]
 
-    assert alignment["score"] == 80.0
+    assert alignment["unpenalized_score"] == 80.0
+    assert alignment["missing_evidence_penalty"] == 20.0
+    assert alignment["score"] == 60.0
     assert alignment["missing_evidence"] == ["missing integration proof", "missing standards proof"]
-    assert "missing_evidence_penalty" not in alignment
-    assert "missing_evidence_penalty" not in result["scores"]["proposal_strength"]
+    assert result["missing_evidence_penalty_per_item"] == 10.0
+    assert result["scores"]["proposal_strength"]["missing_evidence_penalty"] > 0
     assert any(item["category"] == "problem_statement_alignment" for item in result["findings"]["weaknesses"])
 
     custom = evaluate_deck(
@@ -463,9 +465,10 @@ def test_missing_evidence_penalizes_component_and_weighted_scores(tmp_path: Path
         missing_evidence_penalty=5.0,
     )
     custom_alignment = custom["scores"]["proposal_strength"]["components"]["problem_statement_alignment"]
-    assert custom["missing_evidence_penalty_per_item"] == 0.0
-    assert "missing_evidence_penalty" not in custom_alignment
-    assert custom_alignment["score"] == 80.0
+    assert custom["missing_evidence_penalty_per_item"] == 5.0
+    assert custom_alignment["missing_evidence_penalty"] == 10.0
+    assert custom_alignment["score"] == 70.0
+    assert custom["evaluation_fingerprint"] != result["evaluation_fingerprint"]
 
 
 def test_content_visual_and_space_rubric_signals_produce_findings(tmp_path: Path) -> None:

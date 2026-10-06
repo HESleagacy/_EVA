@@ -534,9 +534,8 @@ evaluate-deck \
   --output evidence/input/evaluation.json
 ```
 
-Missing evidence is scored inside the affected criterion. There is no blanket
-per-item deduction; `--missing-evidence-penalty` remains only as a deprecated
-compatibility option.
+Each missing-evidence item deducts 10 points from its component score (0–100
+scale, capped at the component's score). Override with `--missing-evidence-penalty`.
 
 For a structural-only run when no problem statement exists:
 
@@ -923,8 +922,8 @@ The final score is:
 
 `final_score = proposal points (out of 70) + deck points (out of 30) - optional quality penalty`.
 
-Missing evidence is scored inside the affected criterion. There is no blanket
-25-point deduction per missing-evidence string. A rendered semantic response
+Each missing-evidence item deducts 10 points from its component score, capped
+at that component's score. A rendered semantic response
 may provide refined deck-quality judgments; otherwise deterministic geometry
 and content scores are used. A separate quality penalty is capped at 4 deck
 points and requires cited, observable communication problems. The evaluator
