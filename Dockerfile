@@ -12,6 +12,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        libreoffice-impress \
         poppler-utils \
         tesseract-ocr \
         wget \
@@ -30,4 +31,4 @@ RUN addgroup --system --gid 1000 app \
 USER app
 WORKDIR /workspace
 
-CMD ["review-submissions", "--manifest", "/opt/application/submissions.tsv"]
+CMD ["review-submissions"]

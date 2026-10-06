@@ -128,32 +128,32 @@ Build the container image:
 docker build -t document-forensics .
 ```
 
-Run the container to automatically process all presentations from the bundled `submissions.tsv`:
+Put the presentations in `submissions/` and run the container:
 
 ```bash
 docker run --rm \
   --env-file .env \
+  -v "$PWD/submissions:/workspace/submissions:ro" \
   -v "$PWD/evidence:/workspace/evidence" \
   document-forensics
 ```
 
 The container automatically:
-- Sequentially streams each submission URL from the manifest into an isolated sandbox.
+- Processes each `.pptx`, `.ppt`, or `.pdf` file in `submissions/` one at a time, in an isolated temporary directory.
 - Extracts native structure, renders slides, runs OCR, and reconstructs diagrams.
 - Automatically infers the official Problem Statement ID and scrapes requirements from the SIH portal.
 - Evaluates against the rubric with Gemini multimodal vision and semantic scoring (when `GEMINI_API_KEY` is configured in `.env`, or notes "gemini key unavailable" otherwise).
 - Writes individual reports into `evidence/<ps_id>/<team>-<hash>/report.md` and generates `evidence/ranking.md`.
-- Purges the temporary downloaded file immediately after each submission (Option A).
 - Cleanly stops when all submissions are completed.
 
-To process a custom manifest file or directory instead:
+To read from a different folder, mount it and pass it as `--input-dir`:
 
 ```bash
 docker run --rm \
   --env-file .env \
-  -v "$PWD/custom_manifest.tsv:/workspace/submissions.tsv:ro" \
+  -v "$PWD/decks:/workspace/decks:ro" \
   -v "$PWD/evidence:/workspace/evidence" \
-  document-forensics review-submissions --manifest /workspace/submissions.tsv
+  document-forensics review-submissions --input-dir /workspace/decks
 ```
 
 The image has no bundled input or evidence data. Keep API keys in environment
