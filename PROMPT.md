@@ -21,7 +21,7 @@ The completion condition is:
 4. Use the following command, adjusting only paths when necessary:
 
 ```bash
-rank-submissions \
+review-submissions \
   --manifest submissions.tsv \
   --output-dir evidence \
   --semantic-timeout 120 \

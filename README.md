@@ -598,8 +598,7 @@ Every discovered or downloaded file gets a report, including a
 `REVIEW` report when extraction, problem lookup, or evaluation fails; one bad
 file does not stop the remaining files. Each downloaded file is processed in an
 isolated temporary directory and purged immediately after its report is written.
-Use `--quiet` only to hide progress messages. The existing `rank-submissions`
-command is an equivalent name when explicit batch options are preferred.
+Use `--quiet` only to hide progress messages.
 
 If no `--problem` or `--problem-dir` is supplied, the command reads the PS ID
 from native document text (including tokens such as `SIH26168`) and fetches the
@@ -634,7 +633,7 @@ Use explicit options when several submissions target one known problem
 statement. Provide one validated weighted problem JSON for that group:
 
 ```bash
-rank-submissions \
+review-submissions \
   --input-dir submissions \
   --problem problems/26168.json \
   --output-dir reports
