@@ -8,6 +8,8 @@ import hashlib
 import os
 import re
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 from typing import Any
 import urllib.parse
@@ -32,6 +34,7 @@ from .vision import DEFAULT_MAX_OUTPUT_TOKENS, run_selective_vision
 
 
 SUPPORTED_INPUT_SUFFIXES = frozenset({".pdf", ".pptx"})
+LEGACY_PPT_SUFFIX = ".ppt"
 RANKING_SCHEMA_VERSION = "submission-ranking-1.0"
 _PS_ID_PATTERNS = (
     re.compile(r"\bs\s*i\s*h\s*[-_:#]?\s*(\d(?:[\s_-]*\d){4,7})\b", re.IGNORECASE),
@@ -111,10 +114,34 @@ def load_manifest(path: str | Path) -> list[ManifestEntry]:
 
 
 def extension_for_url(url: str) -> str:
-    """Infer .pdf or .pptx extension from a submission URL path."""
+    """Infer the downloaded presentation extension from a submission URL."""
     parsed_path = urllib.parse.urlsplit(url).path
     suffix = Path(parsed_path).suffix.lower()
-    if suffix in SUPPORTED_INPUT_SUFFIXES:
+    if suffix in SUPPORTED_INPUT_SUFFIXES or suffix == LEGACY_PPT_SUFFIX:
+def convert_legacy_ppt(source: Path, destination_dir: Path) -> Path:
+    """Convert a legacy binary PowerPoint file to OOXML for extraction."""
+    executable = shutil.which("libreoffice") or shutil.which("soffice")
+    if executable is None:
+        raise RuntimeError("legacy .ppt input requires libreoffice or soffice for conversion")
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            [executable, "--headless", "--convert-to", "pptx", "--outdir", str(destination_dir), str(source)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "conversion failed").strip()
+        raise RuntimeError(f"legacy .ppt conversion failed: {detail}") from exc
+    converted = destination_dir / f"{source.stem}.pptx"
+    if not converted.is_file():
+        raise RuntimeError("legacy .ppt conversion did not produce a .pptx file")
+    return converted
+
+
         return suffix
     name = Path(parsed_path).name.lower()
     if ".pptx" in name:
@@ -468,6 +495,7 @@ def rank_submissions(
     if manifest is not None:
         total = len(manifest)
         for index, entry in enumerate(manifest, 1):
+                    source_file = convert_legacy_ppt(temp_file, Path(dl_dir) / "converted") if ext == LEGACY_PPT_SUFFIX else temp_file
             if progress is not None:
                 progress(index, total, Path(entry.team_name))
             ext = extension_for_url(entry.url)
@@ -476,7 +504,7 @@ def rank_submissions(
                 try:
                     download_submission_file(entry.url, temp_file, timeout=60.0)
                     result = _process_submission(
-                        temp_file,
+                        source_file,
                         team_override=entry.team_name,
                         single_problem=single_problem,
                         problem_resolver=problem_resolver,
