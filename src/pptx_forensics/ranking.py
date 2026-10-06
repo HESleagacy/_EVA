@@ -1,4 +1,4 @@
-"""Batch evaluation and problem-statement ranking for PPTX and PDF submissions."""
+"""Batch evaluation and problem-statement ranking for PPTX, PPT, and PDF submissions."""
 
 from __future__ import annotations
 
@@ -12,8 +12,6 @@ import shutil
 import subprocess
 import tempfile
 from typing import Any
-import urllib.parse
-import urllib.request
 
 from .deck_evaluation import (
     DECK_COMPONENT_POINTS,
@@ -33,8 +31,7 @@ from .render import render_selected_pdf_pages, render_selected_slides
 from .vision import DEFAULT_MAX_OUTPUT_TOKENS, run_selective_vision
 
 
-SUPPORTED_INPUT_SUFFIXES = frozenset({".pdf", ".pptx"})
-LEGACY_PPT_SUFFIX = ".ppt"
+SUPPORTED_INPUT_SUFFIXES = frozenset({".pdf", ".pptx", ".ppt"})
 RANKING_SCHEMA_VERSION = "submission-ranking-1.0"
 _PS_ID_PATTERNS = (
     re.compile(r"\bs\s*i\s*h\s*[-_:#]?\s*(\d(?:[\s_-]*\d){4,7})\b", re.IGNORECASE),
@@ -70,54 +67,6 @@ class BucketThresholds:
             raise ValueError("bucket thresholds must satisfy 0 <= promising <= strong <= excellent <= 100")
 
 
-@dataclass(frozen=True)
-class ManifestEntry:
-    """Entry loaded from a submissions manifest file."""
-
-    team_name: str
-    url: str
-    demo_url: str = ""
-
-
-def load_manifest(path: str | Path) -> list[ManifestEntry]:
-    """Parse a TSV or CSV manifest file containing teamName and ppt URL."""
-    manifest_path = Path(path).expanduser().resolve()
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"Manifest file not found: {manifest_path}")
-    entries: list[ManifestEntry] = []
-    lines = manifest_path.read_text(encoding="utf-8").splitlines()
-    header_seen = False
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split("\t") if "\t" in line else [item.strip() for item in line.split(",")]
-        if not header_seen:
-            first = parts[0].strip().lower()
-            if "team" in first or "ppt" in first or "url" in first:
-                header_seen = True
-                continue
-            header_seen = True
-        team = parts[0].strip()
-        url = parts[1].strip() if len(parts) > 1 else ""
-        demo = parts[2].strip() if len(parts) > 2 else ""
-        if url:
-            entries.append(ManifestEntry(team_name=team or "Unknown", url=url, demo_url=demo))
-    return entries
-
-
-def extension_for_url(url: str) -> str:
-    """Infer the downloaded presentation extension from a submission URL."""
-    parsed_path = urllib.parse.urlsplit(url).path
-    suffix = Path(parsed_path).suffix.lower()
-    if suffix in SUPPORTED_INPUT_SUFFIXES or suffix == LEGACY_PPT_SUFFIX:
-        return suffix
-    name = Path(parsed_path).name.lower()
-    if ".pptx" in name:
-        return ".pptx"
-    return ".pdf"
-
-
 def convert_legacy_ppt(source: Path, destination_dir: Path) -> Path:
     """Convert a legacy binary PowerPoint file to OOXML for extraction."""
     executable = shutil.which("libreoffice") or shutil.which("soffice")
@@ -140,19 +89,6 @@ def convert_legacy_ppt(source: Path, destination_dir: Path) -> Path:
     if not converted.is_file():
         raise RuntimeError("legacy .ppt conversion did not produce a .pptx file")
     return converted
-
-
-def download_submission_file(url: str, destination: Path, timeout: float = 60.0) -> None:
-    """Stream a remote presentation file to local disk."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; DocumentForensics/1.0)"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        with open(destination, "wb") as output_file:
-            while chunk := response.read(65536):
-                output_file.write(chunk)
 
 
 @dataclass
@@ -193,7 +129,7 @@ def discover_sources(
     *,
     recursive: bool = True,
 ) -> list[Path]:
-    """Discover supported PPTX/PDF files from explicit paths and directories."""
+    """Discover supported PPTX/PPT/PDF files from explicit paths and directories."""
     candidates: list[Path] = []
     for raw in [*paths, *input_dirs]:
         path = Path(raw).expanduser().resolve()
@@ -212,7 +148,7 @@ def discover_sources(
         )
     unique = {item for item in candidates}
     if not unique:
-        raise ValueError("no .pptx or .pdf submissions were found")
+        raise ValueError("no .pptx, .ppt, or .pdf submissions were found")
     return sorted(unique, key=lambda item: str(item).casefold())
 
 
@@ -442,7 +378,6 @@ def rank_submissions(
     sources: Sequence[str | Path] = (),
     output_dir: str | Path = Path("evidence"),
     *,
-    manifest: Sequence[ManifestEntry] | None = None,
     problem: ProblemStatement | Mapping[str, Any] | str | Path | None = None,
     problem_resolver: Callable[[str], ProblemStatement] | None = None,
     ps_id: str | None = None,
@@ -479,111 +414,52 @@ def rank_submissions(
     single_problem = _coerce_problem(problem) if problem is not None else None
     if single_problem is None and problem_resolver is None:
         raise ProblemStatementError("a problem statement or problem resolver is required")
-    if not sources and not manifest:
-        raise ValueError("at least one submission or manifest entry is required")
+    if not sources:
+        raise ValueError("at least one submission is required")
     output_root = Path(output_dir).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     results: list[SubmissionResult] = []
 
-    if manifest is not None:
-        total = len(manifest)
-        for index, entry in enumerate(manifest, 1):
-            if progress is not None:
-                progress(index, total, Path(entry.team_name))
-            ext = extension_for_url(entry.url)
-            with tempfile.TemporaryDirectory(prefix="submission-dl-") as dl_dir:
-                temp_file = Path(dl_dir) / f"{safe_slug(entry.team_name)}{ext}"
-                try:
-                    download_submission_file(entry.url, temp_file, timeout=60.0)
-                    source_file = convert_legacy_ppt(temp_file, Path(dl_dir) / "converted") if ext == LEGACY_PPT_SUFFIX else temp_file
-                    result = _process_submission(
-                        source_file,
-                        team_override=entry.team_name,
-                        single_problem=single_problem,
-                        problem_resolver=problem_resolver,
-                        forced_ps_id=ps_id,
-                        native_only=native_only,
-                        skip_render=skip_render,
-                        skip_ocr=skip_ocr,
-                        skip_diagrams=skip_diagrams,
-                        skip_vision=skip_vision,
-                        skip_semantic=skip_semantic,
-                        aurochs_root=aurochs_root,
-                        pdf_render_dpi=pdf_render_dpi,
-                        render_cache_dir=render_cache_dir,
-                        ocr_cache_dir=ocr_cache_dir,
-                        diagram_ocr_cache_dir=diagram_ocr_cache_dir,
-                        vision_cache_dir=vision_cache_dir,
-                        vision_ocr_cache_dir=vision_ocr_cache_dir,
-                        semantic_cache_dir=semantic_cache_dir,
-                        vision_model=vision_model,
-                        vision_timeout=vision_timeout,
-                        vision_retries=vision_retries,
-                        vision_thinking_budget=vision_thinking_budget,
-                        vision_max_output_tokens=vision_max_output_tokens,
-                        vision_concurrency=vision_concurrency,
-                        vision_include_noise=vision_include_noise,
-                        semantic_timeout=semantic_timeout,
-                        fresh_semantic=fresh_semantic,
-                        missing_evidence_penalty=missing_evidence_penalty,
-                    )
-                except Exception as exc:
-                    result = SubmissionResult(
-                        source=Path(entry.url),
-                        submission_id=f"{safe_slug(entry.team_name)}-download-failed",
-                        team=entry.team_name,
-                        ps_id=normalize_ps_id(ps_id) if ps_id else (normalize_ps_id(single_problem.id) if single_problem else "UNASSIGNED"),
-                        problem_title=single_problem.title if single_problem else "Unavailable",
-                        status="failed",
-                        error=f"Download or extraction failed: {exc}",
-                    )
-            # Temporary downloaded presentation file in dl_dir is automatically deleted here (Option A)
-            report_dir = output_root / safe_slug(result.ps_id, "UNASSIGNED") / safe_slug(result.submission_id)
-            report_dir.mkdir(parents=True, exist_ok=True)
-            result.report_path = report_dir / "report.md"
-            result.report_path.write_text(render_evaluation_markdown(result), encoding="utf-8")
-            results.append(result)
-    else:
-        total = len(sources)
-        for index, raw_source in enumerate(sources, 1):
-            source = Path(raw_source).expanduser().resolve()
-            if progress is not None:
-                progress(index, total, source)
-            result = _process_submission(
-                source,
-                single_problem=single_problem,
-                problem_resolver=problem_resolver,
-                forced_ps_id=ps_id,
-                native_only=native_only,
-                skip_render=skip_render,
-                skip_ocr=skip_ocr,
-                skip_diagrams=skip_diagrams,
-                skip_vision=skip_vision,
-                skip_semantic=skip_semantic,
-                aurochs_root=aurochs_root,
-                pdf_render_dpi=pdf_render_dpi,
-                render_cache_dir=render_cache_dir,
-                ocr_cache_dir=ocr_cache_dir,
-                diagram_ocr_cache_dir=diagram_ocr_cache_dir,
-                vision_cache_dir=vision_cache_dir,
-                vision_ocr_cache_dir=vision_ocr_cache_dir,
-                semantic_cache_dir=semantic_cache_dir,
-                vision_model=vision_model,
-                vision_timeout=vision_timeout,
-                vision_retries=vision_retries,
-                vision_thinking_budget=vision_thinking_budget,
-                vision_max_output_tokens=vision_max_output_tokens,
-                vision_concurrency=vision_concurrency,
-                vision_include_noise=vision_include_noise,
-                semantic_timeout=semantic_timeout,
-                fresh_semantic=fresh_semantic,
-                missing_evidence_penalty=missing_evidence_penalty,
-            )
-            report_dir = output_root / safe_slug(result.ps_id, "UNASSIGNED") / safe_slug(result.submission_id)
-            report_dir.mkdir(parents=True, exist_ok=True)
-            result.report_path = report_dir / "report.md"
-            result.report_path.write_text(render_evaluation_markdown(result), encoding="utf-8")
-            results.append(result)
+    total = len(sources)
+    for index, raw_source in enumerate(sources, 1):
+        source = Path(raw_source).expanduser().resolve()
+        if progress is not None:
+            progress(index, total, source)
+        result = _process_submission(
+            source,
+            single_problem=single_problem,
+            problem_resolver=problem_resolver,
+            forced_ps_id=ps_id,
+            native_only=native_only,
+            skip_render=skip_render,
+            skip_ocr=skip_ocr,
+            skip_diagrams=skip_diagrams,
+            skip_vision=skip_vision,
+            skip_semantic=skip_semantic,
+            aurochs_root=aurochs_root,
+            pdf_render_dpi=pdf_render_dpi,
+            render_cache_dir=render_cache_dir,
+            ocr_cache_dir=ocr_cache_dir,
+            diagram_ocr_cache_dir=diagram_ocr_cache_dir,
+            vision_cache_dir=vision_cache_dir,
+            vision_ocr_cache_dir=vision_ocr_cache_dir,
+            semantic_cache_dir=semantic_cache_dir,
+            vision_model=vision_model,
+            vision_timeout=vision_timeout,
+            vision_retries=vision_retries,
+            vision_thinking_budget=vision_thinking_budget,
+            vision_max_output_tokens=vision_max_output_tokens,
+            vision_concurrency=vision_concurrency,
+            vision_include_noise=vision_include_noise,
+            semantic_timeout=semantic_timeout,
+            fresh_semantic=fresh_semantic,
+            missing_evidence_penalty=missing_evidence_penalty,
+        )
+        report_dir = output_root / safe_slug(result.ps_id, "UNASSIGNED") / safe_slug(result.submission_id)
+        report_dir.mkdir(parents=True, exist_ok=True)
+        result.report_path = report_dir / "report.md"
+        result.report_path.write_text(render_evaluation_markdown(result), encoding="utf-8")
+        results.append(result)
 
     assign_ranks(results, thresholds)
     for result in results:
@@ -596,7 +472,6 @@ def rank_submissions(
 def _process_submission(
     source: Path,
     *,
-    team_override: str | None = None,
     single_problem: ProblemStatement | None,
     problem_resolver: Callable[[str], ProblemStatement] | None,
     forced_ps_id: str | None,
@@ -625,22 +500,23 @@ def _process_submission(
     fresh_semantic: bool,
     missing_evidence_penalty: float,
 ) -> SubmissionResult:
-    fallback_id = f"{safe_slug(team_override or source.stem)}-{hashlib.sha256(str(source).encode()).hexdigest()[:8]}"
-    team = team_override or source.stem
+    fallback_id = f"{safe_slug(source.stem)}-{hashlib.sha256(str(source).encode()).hexdigest()[:8]}"
+    team = source.stem
     ps_key = normalize_ps_id(forced_ps_id) if forced_ps_id else normalize_ps_id(single_problem.id) if single_problem else "UNASSIGNED"
     problem_title = single_problem.title if single_problem else "Unavailable"
     try:
         with tempfile.TemporaryDirectory(prefix="pptx-forensics-ranking-") as temporary:
             evidence_dir = Path(temporary) / "evidence"
+            document = convert_legacy_ppt(source, Path(temporary) / "converted") if source.suffix.casefold() == ".ppt" else source
             report = extract_document(
-                source,
+                document,
                 evidence_dir,
                 include_visual_evidence=not native_only,
                 include_native_diagrams=not native_only,
             )
-            team = team_override or infer_team(report, source)
+            team = infer_team(report, document)
             if not single_problem:
-                ps_key = normalize_ps_id(forced_ps_id or infer_ps_id(report, source))
+                ps_key = normalize_ps_id(forced_ps_id or infer_ps_id(report, document))
                 if problem_resolver is None:
                     raise ProblemStatementError("no problem resolver is configured")
                 selected_problem = problem_resolver(ps_key)
@@ -655,17 +531,17 @@ def _process_submission(
                 _safe_stage(
                     report,
                     "rendering",
-                    lambda: _render(report, source, evidence_dir, slides, aurochs_root, pdf_render_dpi, render_cache_dir),
+                    lambda: _render(report, document, evidence_dir, slides, aurochs_root, pdf_render_dpi, render_cache_dir),
                 )
             if not native_only and not skip_ocr:
-                _safe_stage(report, "OCR", lambda: run_ocr(report, source, slides=slides, cache_dir=ocr_cache_dir))
+                _safe_stage(report, "OCR", lambda: run_ocr(report, document, slides=slides, cache_dir=ocr_cache_dir))
             if not native_only and not skip_diagrams:
                 _safe_stage(
                     report,
                     "diagram reconstruction",
                     lambda: reconstruct_raster_diagrams(
                         report,
-                        source,
+                        document,
                         slides=slides,
                         ocr_cache_dir=diagram_ocr_cache_dir or ocr_cache_dir,
                         run_ocr_stage=not skip_ocr,
@@ -678,7 +554,7 @@ def _process_submission(
                     "vision",
                     lambda: run_selective_vision(
                         report,
-                        source,
+                        document,
                         slides=slides,
                         model=vision_model or "gemini-2.5-flash",
                         cache_dir=vision_cache_dir,
@@ -710,7 +586,7 @@ def _process_submission(
             evidence = _evidence_summary(report, evaluation)
             evidence["Missing-evidence policy"] = f"{missing_evidence_penalty:g} points per missing item, capped at the component score"
             digest = report.source_sha256[:8]
-            submission_id = f"{safe_slug(team)}-{digest}" if team_override else f"{safe_slug(team)}-{safe_slug(source.stem)}-{digest}"
+            submission_id = f"{safe_slug(team)}-{safe_slug(source.stem)}-{digest}"
             return SubmissionResult(
                 source=source,
                 submission_id=submission_id,
