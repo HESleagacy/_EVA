@@ -708,7 +708,7 @@ def _process_submission(
             proposal_score = _score(evaluation, ("scores", "proposal_strength", "score"))
             deck_quality_score = _score(evaluation, ("scores", "deck_quality", "score"))
             evidence = _evidence_summary(report, evaluation)
-            evidence["Missing-evidence policy"] = "Criterion-scoped; no blanket per-item deduction"
+            evidence["Missing-evidence policy"] = f"{missing_evidence_penalty:g} points per missing item, capped at the component score"
             digest = report.source_sha256[:8]
             submission_id = f"{safe_slug(team)}-{digest}" if team_override else f"{safe_slug(team)}-{safe_slug(source.stem)}-{digest}"
             return SubmissionResult(

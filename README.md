@@ -653,7 +653,7 @@ Each submission report is a concise scorecard: final points, one row per rubric
 criterion, a short evidence basis, up to three strengths, up to three main
 deductions, and a one-sentence verdict. Linked repositories and external PS
 pages are not browsed. Missing evidence is reported inside the affected
-criterion rather than guessed or blanket-penalized.
+criterion and deducts the per-item penalty from it.
 
 ### Output Layout
 
